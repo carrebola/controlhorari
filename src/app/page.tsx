@@ -52,6 +52,13 @@ export default function Home() {
         data.history.rows = data.history.rows.map((cells) => cells.map((value, column) =>
           column === 1 ? value.replace(/(\d{1,2}:\d{2})\s*(?=\d{1,2}:\d{2})/g, "$1 · ") : value,
         ));
+        try {
+          const journal = JSON.parse(localStorage.getItem(`timenet-punches:${code}`) || "{}");
+          data.history.markSources = Object.fromEntries(data.history.rows.map((cells) => {
+            const times = /\s+a\s+/.test(cells[1]) ? [] : cells[1].match(/\d{1,2}:\d{2}/g) || [];
+            return [cells[0], times.map((time, index) => journal[`${cells[0]}:${index % 2 === 0 ? "entry" : "exit"}`]?.time?.slice(0, 5) === time ? "automatic" : "unknown")];
+          }));
+        } catch { /* Origin remains unknown without a confirmed local record. */ }
       }
       if (data.ok) saveResult({ ...data, calendar: cached?.calendar || data.calendar });
       else if (cached) setNotice(`${data.message || "No se pudo actualizar."} Mostrando datos guardados.`);
@@ -130,6 +137,55 @@ export default function Home() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, [result, schedule, margin, pin]);
+  useEffect(() => {
+    if (!automatic || !known || !pin || !result?.ok) return;
+    let running = false;
+    let stopped = false;
+    const tick = async () => {
+      if (running || stopped) return;
+      const now = new Date();
+      const date = new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Madrid", day: "2-digit", month: "2-digit", year: "numeric" }).format(now);
+      const agenda = result.calendar?.schedule?.find((day) => day.date === date);
+      const plan = calculated[date];
+      if (!agenda?.intervals.length || !plan || !schedule[agenda.weekday]?.enabled) return;
+      const time = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(now);
+      const seconds = (value: string) => value.split(":").reduce((total, part) => total * 60 + Number(part), 0);
+      for (const action of ["entry", "exit"] as const) {
+        const delay = seconds(time) - seconds(plan[action]);
+        if (delay < 0 || delay > 90 || stopped) continue;
+        const execute = async () => {
+          const storageKey = `timenet-punches:${pin}`;
+          const key = `${date}:${action}`;
+          let journal;
+          try {
+            if (localStorage.getItem("timenet-auto") !== "true") return;
+            journal = JSON.parse(localStorage.getItem(storageKey) || "{}");
+            if (journal[key]) return;
+            journal[key] = { status: "pending", target: plan[action] };
+            localStorage.setItem(storageKey, JSON.stringify(journal));
+          } catch { setNotice("No se puede fichar automáticamente sin guardar el estado en el dispositivo."); return; }
+          running = true;
+          try {
+            const response = await fetch("/api/punch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin, date, action, target: plan[action] }) });
+            const outcome = await response.json();
+            journal = JSON.parse(localStorage.getItem(storageKey) || "{}");
+            journal[key] = { ...journal[key], status: outcome.ok ? outcome.skipped ? "skipped" : "confirmed" : "error", time: outcome.time, message: outcome.message };
+            localStorage.setItem(storageKey, JSON.stringify(journal));
+            setNotice(outcome.ok ? outcome.skipped ? outcome.message : `${action === "entry" ? "Entrada" : "Salida"} automática registrada a las ${outcome.time}.` : outcome.message);
+            if (outcome.ok || outcome.uncertain) void load(pin);
+          } catch { setNotice("No se pudo confirmar el fichaje automático. Revisa el registro antes de repetir."); }
+          finally { running = false; }
+        };
+        if (navigator.locks) await navigator.locks.request(`timenet-punch:${pin}`, execute);
+        else await execute();
+      }
+    };
+    const timer = window.setInterval(() => void tick(), 5000);
+    void tick();
+    return () => { stopped = true; window.clearInterval(timer); };
+  // The timer uses the current loaded schedule and stops when automation is disabled.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [automatic, known, pin, result, calculated, schedule]);
   const row = result?.history?.rows.find((r) => r[0] === today);
   const todayAgenda = result?.calendar?.schedule?.find((day) => day.date === today);
   function login(e: FormEvent) { e.preventDefault(); void load(pin); }
@@ -141,7 +197,7 @@ export default function Home() {
         {result?.ok && calendarBusy && !result.calendar?.schedule?.length && <p role="status" className="mt-2 text-sm text-zinc-500">Consultando horario previsto…</p>}
         {!busy && result?.calendar?.error && <p className="mt-2 text-xs text-zinc-500">{result.calendar.error}</p>}
         {busy && !result?.ok ? <p className="py-10" role="status">Consultando tu jornada…</p> : result?.ok && <div className="mt-5"><HistoryDay cells={row || [today, "", "", "", ""]} planned={todayAgenda?.intervals} kind={todayAgenda?.kind} calculated={calculated[today]} sources={result.history?.markSources?.[today]} /></div>}
-        <div className="flex items-center justify-between gap-4 border-b border-zinc-200 py-6"><div><h3 className="font-medium">Fichaje automático</h3><p className="mt-1 text-xs text-zinc-500">{automatic ? "Activado como preferencia. Programación pendiente." : "Desactivado"}</p></div><button role="switch" aria-checked={automatic} aria-label="Fichaje automático" className={`relative h-7 w-12 shrink-0 rounded-full ${automatic ? "bg-emerald-600" : "bg-zinc-300"}`} onClick={() => { setAutomatic(!automatic); persist("timenet-auto", String(!automatic)); }}><span className={`absolute left-0 top-1 h-5 w-5 rounded-full bg-white transition-transform ${automatic ? "translate-x-6" : "translate-x-1"}`} /></button></div>
+        <div className="flex items-center justify-between gap-4 border-b border-zinc-200 py-6"><div><h3 className="font-medium">Fichaje automático</h3><p className="mt-1 text-xs text-zinc-500">{automatic ? "Activo mientras esta app esté abierta." : "Desactivado"}</p></div><button role="switch" aria-checked={automatic} aria-label="Fichaje automático" className={`relative h-7 w-12 shrink-0 rounded-full ${automatic ? "bg-emerald-600" : "bg-zinc-300"}`} onClick={() => { setAutomatic(!automatic); persist("timenet-auto", String(!automatic)); }}><span className={`absolute left-0 top-1 h-5 w-5 rounded-full bg-white transition-transform ${automatic ? "translate-x-6" : "translate-x-1"}`} /></button></div>
         <div className="grid gap-3 pt-6"><Button variant="secondary" className="h-12 justify-start" onClick={() => setView("history")}><History className="h-5 w-5" />Historial de marcajes</Button></div></section>}
       {view === "history" && <section className="py-6"><h2 className="text-xl font-semibold">Historial de marcajes</h2><div className="mt-4 grid grid-cols-3 gap-3 border-b pb-4">{[["Previstas", result?.history?.planned], ["Trabajadas", result?.history?.worked], ["Diferencia", result?.history?.difference]].map(([label, value]) => <div key={label}><p className="text-xs text-zinc-500">{label}</p><p className="font-semibold">{value || "—"}</p></div>)}</div><div className="mt-5 space-y-3">{result?.history?.rows.map((cells) => { const agenda = result.calendar?.schedule?.find((day) => day.date === cells[0]); return <HistoryDay key={cells[0]} cells={cells} planned={agenda?.intervals} kind={agenda?.kind} calculated={calculated[cells[0]]} sources={result.history?.markSources?.[cells[0]]} />; })}</div></section>}
       {view === "schedule" && <section className="py-6">
