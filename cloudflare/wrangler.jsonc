@@ -1,0 +1,32 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "controlhorari-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.05 }
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "controlhorari",
+      "database_id": "51e47e5c-8135-41d6-bc75-c33d45bc8157",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "APP_ORIGIN": "https://controlhorari.vercel.app",
+    "TIMENET_LOGIN_URL": "https://timenet-wcp.gpisoftware.com/login/1b64e567-7e18-40a5-b545-f0ab35cc1810",
+    "TIME_ZONE": "Europe/Madrid"
+  }
+}

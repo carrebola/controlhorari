@@ -1,12 +1,17 @@
 {
-  "name": "controlhorario",
+  "name": "carrebola-controlhorari",
   "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "cf:dev": "wrangler dev --config cloudflare/wrangler.jsonc",
+    "cf:typecheck": "tsc -p cloudflare/tsconfig.json",
+    "cf:migrate:local": "wrangler d1 migrations apply DB --local --config cloudflare/wrangler.jsonc",
+    "cf:migrate:remote": "wrangler d1 migrations apply DB --remote --config cloudflare/wrangler.jsonc",
+    "cf:deploy": "wrangler deploy --config cloudflare/wrangler.jsonc"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.5.0",
@@ -20,6 +25,7 @@
     "tailwind-merge": "^3.7.0"
   },
   "devDependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
     "@tailwindcss/turbopack": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
@@ -27,6 +33,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.4.0",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "^4.151.0"
   }
 }
