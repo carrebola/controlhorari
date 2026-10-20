@@ -2,7 +2,7 @@ import webpush from "web-push";
 import type { Env } from "./types";
 
 type Subscription = { id: string; endpoint: string; p256dh: string; auth: string };
-type PushPayload = { title: string; body: string; tag: string; url: string };
+type PushPayload = { title: string; body: string; tag: string; url: string; level: string };
 
 export function pushConfig(env: Env) {
   return { configured: Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY), publicKey: env.VAPID_PUBLIC_KEY || "" };
@@ -39,7 +39,7 @@ export async function testPush(env: Env, userId: string, endpoint: string) {
   if (!pushConfig(env).configured) throw new Error("Las notificaciones no están configuradas en el servidor.");
   const sub = await env.DB.prepare("SELECT * FROM push_subscriptions WHERE user_id = ? AND endpoint = ?").bind(userId, endpoint).first<Subscription>();
   if (!sub) throw new Error("Activa las notificaciones en este dispositivo primero.");
-  const accepted = await send(env, sub, { title: "Notificaciones activadas", body: "Recibirás un aviso cuando se registre un fichaje o haya un problema.", tag: `test-${crypto.randomUUID()}`, url: "/?view=notifications" });
+  const accepted = await send(env, sub, { title: "Notificaciones activadas", body: "Recibirás un aviso cuando se registre un fichaje o haya un problema.", tag: `test-${crypto.randomUUID()}`, url: "/?view=notifications", level: "info" });
   if (!accepted) throw new Error("La suscripción ha caducado. Desactiva y vuelve a activar las notificaciones.");
 }
 
@@ -47,15 +47,15 @@ export async function flushPush(env: Env) {
   if (!pushConfig(env).configured) return;
   const now = Date.now();
   await env.DB.prepare("UPDATE notifications SET push_state = 'pending' WHERE push_state = 'sending' AND push_updated_at < ?").bind(now - 120_000).run();
-  const pending = await env.DB.prepare("SELECT id, user_id, title, message FROM notifications WHERE push_state = 'pending' AND push_attempts < 3 ORDER BY created_at LIMIT 20")
-    .all<{ id: string; user_id: string; title: string; message: string }>();
+  const pending = await env.DB.prepare("SELECT id, user_id, title, message, level FROM notifications WHERE push_state = 'pending' AND push_attempts < 3 ORDER BY created_at LIMIT 20")
+    .all<{ id: string; user_id: string; title: string; message: string; level: string }>();
   for (const notice of pending.results) {
     const claim = await env.DB.prepare("UPDATE notifications SET push_state = 'sending', push_attempts = push_attempts + 1, push_updated_at = ? WHERE id = ? AND push_state = 'pending'").bind(now, notice.id).run();
     if (!claim.meta.changes) continue;
     try {
       const subscriptions = await env.DB.prepare("SELECT s.* FROM push_subscriptions s WHERE s.user_id = ? AND NOT EXISTS (SELECT 1 FROM push_deliveries d WHERE d.notice_id = ? AND d.subscription_id = s.id)").bind(notice.user_id, notice.id).all<Subscription>();
       const results = await Promise.allSettled(subscriptions.results.map(async (sub) => {
-        await send(env, sub, { title: notice.title, body: notice.message, tag: notice.id, url: "/?view=notifications" });
+        await send(env, sub, { title: notice.title, body: notice.message, tag: notice.id, url: "/?view=notifications", level: notice.level });
         // Expired subscriptions were removed together with their receipts.
         await env.DB.prepare("INSERT OR IGNORE INTO push_deliveries (notice_id, subscription_id) SELECT ?, id FROM push_subscriptions WHERE id = ?").bind(notice.id, sub.id).run();
       }));

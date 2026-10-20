@@ -13,9 +13,16 @@ self.addEventListener('fetch', event => {
 self.addEventListener('push', event => {
   let data = {};
   try { data = event.data?.json() || {}; } catch { /* Show a generic notice if a payload is malformed. */ }
-  event.waitUntil(self.registration.showNotification(data.title || 'Control Horari', {
+  const styles = {
+    success: { symbol: '✅', icon: '/notification-success.png' },
+    error: { symbol: '❌', icon: '/notification-error.png' },
+    warning: { symbol: '⚠️', icon: '/notification-warning.png' },
+    info: { symbol: 'ℹ️', icon: '/icon-192.png' },
+  };
+  const style = Object.hasOwn(styles, data.level) ? styles[data.level] : styles.info;
+  event.waitUntil(self.registration.showNotification(`${style.symbol} ${data.title || 'Control Horari'}`, {
     body: data.body || 'Hay una novedad en tu fichaje.',
-    icon: '/icon-192.png', tag: data.tag || 'controlhorari',
+    icon: style.icon, tag: data.tag || 'controlhorari',
     data: { url: '/?view=notifications' },
   }));
 });
