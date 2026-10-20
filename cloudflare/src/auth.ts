@@ -53,9 +53,11 @@ export interface NewUserInput {
 export async function createUser(env: Env, input: NewUserInput) {
   const username = input.username.trim().toLowerCase();
   const displayName = input.displayName.trim();
-  if (!/^[a-z0-9._-]{3,40}$/.test(username)) throw new Error("El usuario debe tener entre 3 y 40 caracteres válidos.");
+  const validName = /^[a-z0-9._-]{3,40}$/.test(username);
+  const validEmail = username.length <= 254 && /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(username);
+  if (!validName && !validEmail) throw new Error("Introduce un nombre de usuario válido o un correo electrónico.");
   if (displayName.length < 2 || displayName.length > 80) throw new Error("El nombre visible no es válido.");
-  if (input.password.length < 10) throw new Error("La contraseña debe tener al menos 10 caracteres.");
+  if (input.password.length < 10 || input.password.length > 256) throw new Error("La contraseña debe tener entre 10 y 256 caracteres.");
   if (!/^\d{3,20}$/.test(input.timenetPin)) throw new Error("El PIN de Timenet debe contener solo números.");
   const salt = randomBase64(16);
   const encryptedPin = await encryptSecret(input.timenetPin, env.DATA_ENCRYPTION_KEY);

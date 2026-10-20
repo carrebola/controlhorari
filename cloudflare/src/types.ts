@@ -1,4 +1,4 @@
-export type Env = Cloudflare.Env;
+export type Env = Cloudflare.Env & { VAPID_PUBLIC_KEY?: string; VAPID_PRIVATE_KEY?: string; VAPID_SUBJECT?: string };
 
 export type UserRole = "user" | "admin";
 export type JobAction = "entry" | "exit";
@@ -34,6 +34,7 @@ export interface JobRow {
   local_date: string;
   action: JobAction;
   target_at: number;
+  planned_at: number | null;
   status: JobStatus;
   attempt_count: number;
   claimed_at: number | null;
@@ -43,6 +44,18 @@ export interface JobRow {
   error_message: string | null;
   created_at: number;
   updated_at: number;
+}
+
+export interface CalendarDayRow {
+  user_id: string;
+  local_date: string;
+  label: string;
+  entry_time: string | null;
+  exit_time: string | null;
+  random_entry_at: number | null;
+  random_exit_at: number | null;
+  margin_seconds: number;
+  synced_at: number;
 }
 
 export interface SessionUser {

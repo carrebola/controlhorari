@@ -7,11 +7,13 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "cf:dev": "wrangler dev --config cloudflare/wrangler.jsonc",
+    "cf:dev": "node --require ./scripts/local-browser.cjs ./node_modules/wrangler/bin/wrangler.js dev --config cloudflare/wrangler.jsonc",
     "cf:typecheck": "tsc -p cloudflare/tsconfig.json",
     "cf:migrate:local": "wrangler d1 migrations apply DB --local --config cloudflare/wrangler.jsonc",
     "cf:migrate:remote": "wrangler d1 migrations apply DB --remote --config cloudflare/wrangler.jsonc",
-    "cf:deploy": "wrangler deploy --config cloudflare/wrangler.jsonc"
+    "cf:deploy": "wrangler deploy --config cloudflare/wrangler.jsonc",
+    "push:setup": "node scripts/setup-push.cjs",
+    "test:push:worker": "node scripts/push-worker-check.cjs"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.5.0",
@@ -22,7 +24,8 @@
     "playwright": "^1.64.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
-    "tailwind-merge": "^3.7.0"
+    "tailwind-merge": "^3.7.0",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "@cloudflare/puppeteer": "^1.4.0",
@@ -30,6 +33,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/web-push": "^3.6.4",
     "eslint": "^9",
     "eslint-config-next": "16.4.0",
     "tailwindcss": "^4",

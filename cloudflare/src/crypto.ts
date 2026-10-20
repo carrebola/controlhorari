@@ -30,14 +30,20 @@ export async function secureEqual(left: string, right: string) {
   return constantTimeEqual(leftHash, rightHash);
 }
 
-export async function hashPassword(password: string, salt: string, pepper: string) {
+async function derivePassword(password: string, salt: string, pepper: string, iterations: number) {
   const material = await crypto.subtle.importKey("raw", encoder.encode(`${password}:${pepper}`), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt: base64ToBytes(salt), iterations: 120_000 },
+    { name: "PBKDF2", hash: "SHA-256", salt: base64ToBytes(salt), iterations },
     material,
     256,
   );
   return bytesToBase64(new Uint8Array(bits));
+}
+
+export async function hashPassword(password: string, salt: string, pepper: string) {
+  // Workers caps WebCrypto PBKDF2 at 100,000 iterations. Version the hash so
+  // previously created local accounts retain their original work factor.
+  return `pbkdf2-sha256:100000:${await derivePassword(password, salt, pepper, 100_000)}`;
 }
 
 export function randomBase64(size = 32) {
@@ -45,7 +51,9 @@ export function randomBase64(size = 32) {
 }
 
 export async function verifyPassword(password: string, salt: string, expected: string, pepper: string) {
-  return constantTimeEqual(await hashPassword(password, salt, pepper), expected);
+  const prefix = "pbkdf2-sha256:100000:";
+  if (expected.startsWith(prefix)) return constantTimeEqual(await derivePassword(password, salt, pepper, 100_000), expected.slice(prefix.length));
+  return constantTimeEqual(await derivePassword(password, salt, pepper, 120_000), expected);
 }
 
 async function importEncryptionKey(encodedKey: string) {

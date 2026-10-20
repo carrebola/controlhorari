@@ -1,9 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const sessionCookie = "controlhorari_session";
+export const maxDuration = 120;
 
 async function proxy(request: NextRequest, context: RouteContext<"/api/backend/[...path]">) {
   const { path } = await context.params;
+  if (process.env.NODE_ENV === "production" && !process.env.WORKER_API_URL) {
+    return NextResponse.json({ ok: false, message: "Falta configurar el servidor de automatización." }, { status: 503 });
+  }
   const backendUrl = process.env.WORKER_API_URL || "http://127.0.0.1:8787";
   const target = new URL(`/api/${path.join("/")}`, backendUrl);
   target.search = request.nextUrl.search;
@@ -13,12 +17,19 @@ async function proxy(request: NextRequest, context: RouteContext<"/api/backend/[
   const contentType = request.headers.get("content-type");
   if (contentType) headers.set("content-type", contentType);
   const hasBody = !["GET", "HEAD"].includes(request.method);
-  const upstream = await fetch(target, {
+  let upstream: Response;
+  try { upstream = await fetch(target, {
     method: request.method,
     headers,
     body: hasBody ? await request.text() : undefined,
     cache: "no-store",
-  });
+    signal: AbortSignal.timeout(110_000),
+  }); } catch {
+    const response = NextResponse.json({ ok: false, message: "No se pudo confirmar la respuesta del servidor. Sincroniza antes de repetir un fichaje." }, { status: 502 });
+    response.headers.set("cache-control", "no-store");
+    if (path.join("/") === "auth/logout") response.cookies.delete(sessionCookie);
+    return response;
+  }
   const raw = await upstream.text();
   let data: Record<string, unknown>;
   try {

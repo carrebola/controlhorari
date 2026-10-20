@@ -1,7 +1,8 @@
 import { decryptSecret } from "./crypto";
 import { addRandomMargin, localDate, localParts, weekdayForLocalDate, zonedDateTimeToEpoch } from "./time";
-import { punchTimenet } from "./timenet";
-import type { Env, JobRow, ScheduleRow, UserRow } from "./types";
+import { punchTimenet, readTimenetHistory } from "./timenet";
+import { guardedPunch } from "./punch-guard";
+import type { CalendarDayRow, Env, JobRow, ScheduleRow, UserRow } from "./types";
 
 const MISSED_AFTER_MS = 10 * 60 * 1000;
 const MAX_JOBS_PER_RUN = 3;
@@ -32,18 +33,22 @@ async function ensureTodayJobs(env: Env, now: number) {
   let created = 0;
   for (const user of users.results) {
     const parts = localParts(now, user.time_zone);
+    const date = localDate(now, user.time_zone);
+    const calendar = await env.DB.prepare("SELECT * FROM calendar_days WHERE user_id = ? AND local_date = ?")
+      .bind(user.id, date).first<CalendarDayRow>();
     const weekday = weekdayForLocalDate(parts);
     const schedule = await env.DB.prepare("SELECT * FROM schedules WHERE user_id = ? AND weekday = ? AND enabled = 1")
       .bind(user.id, weekday).first<ScheduleRow>();
-    if (!schedule) continue;
-    const date = localDate(now, user.time_zone);
-    for (const [action, configuredTime] of [["entry", schedule.entry_time], ["exit", schedule.exit_time]] as const) {
-      const targetAt = addRandomMargin(zonedDateTimeToEpoch(parts, `${configuredTime}:00`, user.time_zone), user.margin_seconds);
+    if (calendar ? !calendar.entry_time || !calendar.exit_time : !schedule) continue;
+    const entry = calendar?.entry_time ?? schedule!.entry_time;
+    const exit = calendar?.exit_time ?? schedule!.exit_time;
+    for (const [action, configuredTime, calendarTarget] of [["entry", entry, calendar?.random_entry_at], ["exit", exit, calendar?.random_exit_at]] as const) {
+      const targetAt = calendarTarget ?? addRandomMargin(zonedDateTimeToEpoch(parts, `${configuredTime}:00`, user.time_zone), user.margin_seconds);
       const result = await env.DB.prepare(
         `INSERT OR IGNORE INTO jobs
-         (id, user_id, local_date, action, target_at, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?)`,
-      ).bind(crypto.randomUUID(), user.id, date, action, targetAt, now, now).run();
+         (id, user_id, local_date, action, target_at, planned_at, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)`,
+      ).bind(crypto.randomUUID(), user.id, date, action, targetAt, targetAt, now, now).run();
       created += result.meta.changes;
     }
   }
@@ -104,7 +109,17 @@ async function processJob(env: Env, job: DueJob) {
     return { success: false };
   }
 
-  const result = await punchTimenet(env, pin, job.action, job.local_date);
+  const result = await guardedPunch(env, job.user_id, job.local_date, job.action,
+    () => readTimenetHistory(env, pin),
+    async () => {
+      const current = await env.DB.prepare("SELECT enabled FROM users WHERE id = ?").bind(job.user_id).first<{ enabled: number }>();
+      if (!current?.enabled) return { ok: true, skipped: true, code: "disabled", message: "La automatización se ha pausado; no se ha enviado el fichaje." };
+      if (localDate(Date.now(), job.time_zone) !== job.local_date) return { ok: true, skipped: true, code: "date_changed", message: "El día del fichaje ha terminado; no se ha enviado." };
+      return punchTimenet(env, pin, job.action, job.local_date, false, job.time_zone, async () => {
+        const latest = await env.DB.prepare("SELECT enabled FROM users WHERE id = ?").bind(job.user_id).first<{ enabled: number }>();
+        return Boolean(latest?.enabled);
+      });
+    });
   const executedAt = Date.now();
   if (result.ok) {
     const status = result.skipped ? "skipped" : "success";
@@ -169,6 +184,7 @@ export async function runScheduler(env: Env) {
   ).bind(runId, startedAt).run();
   try {
     await env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(startedAt).run();
+    await env.DB.prepare("DELETE FROM login_limits WHERE expires_at <= ?").bind(startedAt).run();
     const ensured = await ensureTodayJobs(env, startedAt);
     await markMissedJobs(env, startedAt);
     const jobs = await claimDueJobs(env, Date.now());

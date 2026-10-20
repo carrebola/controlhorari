@@ -2,3 +2,8 @@ ADMIN_SETUP_SECRET=replace-with-a-long-random-secret
 AUTH_PEPPER=replace-with-a-different-long-random-secret
 DATA_ENCRYPTION_KEY=replace-with-base64-encoded-32-byte-key
 CRON_SECRET=replace-with-another-long-random-secret
+
+# Opcional: genera las claves locales con npm run push:setup
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT=https://controlhorari.vercel.app

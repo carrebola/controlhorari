@@ -1,6 +1,7 @@
 import puppeteer, { type ElementHandle } from "@cloudflare/puppeteer";
 import type { Env, JobAction } from "./types";
-import { localClock } from "./time";
+import { localClock, localDate as currentLocalDate } from "./time";
+import { parseTimenetHistory } from "./timenet-history";
 
 export interface PunchResult {
   ok: boolean;
@@ -11,15 +12,15 @@ export interface PunchResult {
   message: string;
 }
 
-export interface TimenetHistoryEvent {
-  localDate: string;
-  action: JobAction;
-  time: string;
-}
-
 const months = ["gener", "febrer", "març", "abril", "maig", "juny", "juliol", "agost", "setembre", "octubre", "novembre", "desembre"];
 
-export async function punchTimenet(env: Env, pin: string, action: JobAction, localDate: string): Promise<PunchResult> {
+export class TimenetError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+  }
+}
+
+export async function punchTimenet(env: Env, pin: string, action: JobAction, localDate: string, manual = false, timeZone: string = env.TIME_ZONE, beforeClick?: () => Promise<boolean>): Promise<PunchResult> {
   const browser = await puppeteer.launch(env.BROWSER);
   let clicked = false;
   try {
@@ -39,6 +40,7 @@ export async function punchTimenet(env: Env, pin: string, action: JobAction, loc
       return { ok: false, code: "invalid_pin", message: "Timenet ha rechazado el PIN." };
     }
 
+    if (!manual) {
     await page.goto("https://timenet-wcp.gpisoftware.com/calendar", { waitUntil: "domcontentloaded", timeout: 20_000 });
     await page.waitForSelector("gpi-calendar .click-day-control:not(.out-of-year-range)", { timeout: 15_000 });
     const [day, month, year] = localDate.split("/").map(Number);
@@ -66,8 +68,10 @@ export async function punchTimenet(env: Env, pin: string, action: JobAction, loc
     if (/festiu|vacances|no definit/i.test(calendarCheck.text ?? "")) {
       return { ok: true, skipped: true, code: "non_working_day", message: "La agenda indica que hoy no corresponde fichar." };
     }
+    }
 
     await page.goto("https://timenet-wcp.gpisoftware.com/home", { waitUntil: "domcontentloaded", timeout: 20_000 });
+    await page.waitForFunction(() => Array.from(document.querySelectorAll("button, [role=button]")).some((element) => /^(Entrada|Sortida)$/.test(element.textContent?.trim() ?? "")), { timeout: 15_000 });
     const state = await page.evaluate(() => document.body.innerText.split("\n").some((line) => line.trim() === "treballant"));
     if ((action === "entry" && state) || (action === "exit" && !state)) {
       return { ok: true, skipped: true, code: "already_in_state", message: "Timenet ya estaba en el estado esperado; no se ha repetido el fichaje." };
@@ -79,6 +83,8 @@ export async function punchTimenet(env: Env, pin: string, action: JobAction, loc
     );
     const button = buttonHandle.asElement() as ElementHandle<Element> | null;
     if (!button) throw new Error(`No se encontró el botón ${label}.`);
+    if (currentLocalDate(Date.now(), timeZone) !== localDate) return { ok: true, skipped: true, code: "date_changed", message: "El día del fichaje ha cambiado; no se ha enviado." };
+    if (beforeClick && !(await beforeClick())) return { ok: true, skipped: true, code: "disabled", message: "La automatización se ha pausado; no se ha enviado el fichaje." };
     clicked = true;
     await button.click();
     await page.waitForFunction(
@@ -89,7 +95,7 @@ export async function punchTimenet(env: Env, pin: string, action: JobAction, loc
     await buttonHandle.dispose();
     return {
       ok: true,
-      time: localClock(Date.now(), env.TIME_ZONE),
+      time: localClock(Date.now(), timeZone),
       message: `${action === "entry" ? "Entrada" : "Salida"} registrada correctamente.`,
     };
   } catch (error) {
@@ -102,12 +108,15 @@ export async function punchTimenet(env: Env, pin: string, action: JobAction, loc
         : error instanceof Error ? error.message : "No se pudo completar el fichaje.",
     };
   } finally {
-    await browser.close();
+    await browser.close().catch((cause: unknown) => console.error("No se pudo cerrar el navegador de fichaje", cause));
   }
 }
 
-export async function readTimenetHistory(env: Env, pin: string): Promise<TimenetHistoryEvent[]> {
-  const browser = await puppeteer.launch(env.BROWSER);
+export async function readTimenetHistory(env: Env, pin: string): Promise<ReturnType<typeof parseTimenetHistory>> {
+  const browser = await puppeteer.launch(env.BROWSER).catch((cause: unknown) => {
+    console.error("No se pudo iniciar el navegador para sincronizar Timenet", cause);
+    throw new TimenetError("No se pudo iniciar el navegador de sincronización. Si estás en local, revisa el servidor de Cloudflare; después vuelve a intentarlo.", 503);
+  });
   try {
     const page = await browser.newPage();
     page.setDefaultTimeout(15_000);
@@ -121,7 +130,7 @@ export async function readTimenetHistory(env: Env, pin: string): Promise<Timenet
     await login.click();
     await page.waitForFunction(() => location.pathname === "/home" || document.body.innerText.includes("PIN incorrecte"), { timeout: 15_000 });
     await loginHandle.dispose();
-    if (new URL(page.url()).pathname !== "/home") throw new Error("Timenet ha rechazado el PIN.");
+    if (new URL(page.url()).pathname !== "/home") throw new TimenetError("Timenet ha rechazado el PIN. Actualízalo en Configuración y vuelve a sincronizar.", 422);
 
     const historyHandle = await page.evaluateHandle(
       () => Array.from(document.querySelectorAll("a, button, [role=tab], [role=menuitem], body *"))
@@ -129,29 +138,17 @@ export async function readTimenetHistory(env: Env, pin: string): Promise<Timenet
     );
     const historyLink = historyHandle.asElement() as ElementHandle<Element> | null;
     if (!historyLink) throw new Error("No se encontró el historial de Timenet.");
+    const checksResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/v1/cp/checks" && response.request().method() !== "OPTIONS" && response.status() === 200);
     await historyLink.click();
     await page.waitForFunction(() => Array.from(document.querySelectorAll("table")).some((table) => /Marcatges/i.test((table as HTMLElement).innerText)), { timeout: 15_000 });
     await historyHandle.dispose();
 
-    return await page.evaluate(() => {
-      const table = Array.from(document.querySelectorAll("table")).find((element) => /Marcatges/i.test((element as HTMLElement).innerText));
-      if (!table) return [];
-      const headers = Array.from(table.querySelectorAll("tr th")).map((cell) => (cell.textContent ?? "").trim());
-      const marksColumn = headers.findIndex((header) => /marcatges/i.test(header));
-      const rows = Array.from(table.querySelectorAll("tr")).map((row) =>
-        Array.from(row.querySelectorAll("td")).map((cell) => (cell.textContent ?? "").trim()),
-      ).filter((cells) => /^\d{2}\/\d{2}\/\d{4}$/.test(cells[0] ?? ""));
-      return rows.flatMap((cells) => {
-        const value = marksColumn >= 0 ? cells[marksColumn] ?? "" : cells.slice(2).join(" ");
-        const times = Array.from(value.matchAll(/\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\b/g), (match) => match[0].padStart(5, "0"));
-        return times.map((time, index) => ({
-          localDate: cells[0],
-          action: index % 2 === 0 ? "entry" as const : "exit" as const,
-          time,
-        }));
-      });
-    });
+    return parseTimenetHistory(await (await checksResponse).json());
+  } catch (cause) {
+    if (cause instanceof TimenetError) throw cause;
+    console.error("No se pudo leer el historial de Timenet", cause);
+    throw new TimenetError("No se pudo consultar el historial de Timenet. Comprueba la conexión y vuelve a intentarlo.", 502);
   } finally {
-    await browser.close();
+    await browser.close().catch((cause: unknown) => console.error("No se pudo cerrar el navegador de sincronización", cause));
   }
 }

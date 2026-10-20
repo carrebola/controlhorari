@@ -1,8 +1,11 @@
 import { authenticate, createUser, login, logout, type NewUserInput } from "./auth";
-import { decryptSecret, encryptSecret, secureEqual } from "./crypto";
+import { decryptSecret, encryptSecret, secureEqual, sha256 } from "./crypto";
 import { runScheduler } from "./scheduler";
-import { readTimenetHistory } from "./timenet";
-import type { Env, ScheduleRow, SessionUser, UserRow } from "./types";
+import { guardedPunch } from "./punch-guard";
+import { flushPush, pushConfig, testPush, validSubscription } from "./push";
+import { punchTimenet, readTimenetHistory, TimenetError, type PunchResult } from "./timenet";
+import { addRandomMargin, localDate, zonedDateTimeToEpoch } from "./time";
+import type { CalendarDayRow, Env, ScheduleRow, SessionUser, UserRow } from "./types";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -43,17 +46,17 @@ async function requireUser(request: Request, env: Env) {
 }
 
 async function dashboard(env: Env, user: SessionUser) {
-  const [profile, schedules, jobs, events, notifications, latestRun, dayStats] = await Promise.all([
+  const [profile, schedules, jobs, events, notifications, latestRun, dayStats, calendar] = await Promise.all([
     env.DB.prepare("SELECT id, username, display_name, role, enabled, margin_seconds, time_zone FROM users WHERE id = ?")
       .bind(user.id).first(),
     env.DB.prepare("SELECT weekday, enabled, entry_time, exit_time FROM schedules WHERE user_id = ? ORDER BY weekday")
       .bind(user.id).all<ScheduleRow>(),
     env.DB.prepare(
-      `SELECT id, local_date, action, target_at, status, attempt_count, executed_at, timenet_time, error_code, error_message
-       FROM jobs WHERE user_id = ? ORDER BY target_at DESC LIMIT 50`,
+      `SELECT id, local_date, action, target_at, planned_at, status, attempt_count, executed_at, timenet_time, error_code, error_message
+       FROM jobs WHERE user_id = ? ORDER BY target_at DESC LIMIT 200`,
     ).bind(user.id).all(),
     env.DB.prepare(
-      "SELECT id, local_date, action, source, recorded_time, created_at FROM punch_events WHERE user_id = ? ORDER BY created_at DESC, recorded_time DESC LIMIT 100",
+      "SELECT id, local_date, action, source, recorded_time, created_at FROM punch_events WHERE user_id = ? ORDER BY substr(local_date,7,4) DESC, substr(local_date,4,2) DESC, substr(local_date,1,2) DESC, recorded_time DESC LIMIT 1000",
     ).bind(user.id).all(),
     env.DB.prepare(
       "SELECT id, level, title, message, job_id, created_at, read_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
@@ -66,6 +69,8 @@ async function dashboard(env: Env, user: SessionUser) {
        AVG(CASE WHEN executed_at IS NOT NULL THEN executed_at - target_at END) AS average_delay_ms
        FROM jobs WHERE user_id = ? AND target_at >= ?`,
     ).bind(user.id, Date.now() - 24 * 60 * 60 * 1000).first(),
+    env.DB.prepare("SELECT * FROM calendar_days WHERE user_id = ? ORDER BY substr(local_date,7,4) DESC, substr(local_date,4,2) DESC, substr(local_date,1,2) DESC LIMIT 366")
+      .bind(user.id).all<CalendarDayRow>(),
   ]);
   return {
     ok: true,
@@ -73,6 +78,7 @@ async function dashboard(env: Env, user: SessionUser) {
     schedules: schedules.results,
     jobs: jobs.results,
     events: events.results,
+    calendar: calendar.results,
     notifications: notifications.results,
     health: {
       latestRun,
@@ -83,17 +89,49 @@ async function dashboard(env: Env, user: SessionUser) {
 }
 
 async function syncHistory(env: Env, user: SessionUser) {
-  const credentials = await env.DB.prepare("SELECT pin_ciphertext, pin_iv FROM users WHERE id = ?").bind(user.id).first<UserRow>();
+  const credentials = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(user.id).first<UserRow>();
   if (!credentials) return error("Usuario no encontrado.", 404);
   const pin = await decryptSecret(credentials.pin_ciphertext, credentials.pin_iv, env.DATA_ENCRYPTION_KEY);
-  const remoteEvents = await readTimenetHistory(env, pin);
+  const snapshot = await readTimenetHistory(env, pin);
+  const remoteEvents = snapshot.events;
+  const previous = await env.DB.prepare("SELECT * FROM calendar_days WHERE user_id = ?").bind(user.id).all<CalendarDayRow>();
   const automatic = await env.DB.prepare(
     "SELECT id, job_id, local_date, action, recorded_time FROM punch_events WHERE user_id = ? AND source = 'automatic'",
   ).bind(user.id).all<{ id: string; job_id: string | null; local_date: string; action: string; recorded_time: string }>();
   const minute = (value: string) => value.slice(0, 5);
   const now = Date.now();
   const statements: D1PreparedStatement[] = [];
+  const today = localDate(now, credentials.time_zone);
+  const dateKey = (date: string) => date.split("/").reverse().join("-");
+  for (const day of snapshot.days) {
+    const old = previous.results.find((row) => row.local_date === day.localDate);
+    const samePlan = old && old.entry_time === day.entryTime && old.exit_time === day.exitTime;
+    let entryAt = samePlan ? old.random_entry_at : null;
+    let exitAt = samePlan ? old.random_exit_at : null;
+    if (day.entryTime && day.exitTime && dateKey(day.localDate) >= dateKey(today) && (!samePlan || entryAt === null || exitAt === null)) {
+      const [d, m, y] = day.localDate.split("/").map(Number);
+      const parts = { day: d, month: m, year: y };
+      const baseEntry = zonedDateTimeToEpoch(parts, day.entryTime, credentials.time_zone);
+      let baseExit = zonedDateTimeToEpoch(parts, day.exitTime, credentials.time_zone);
+      if (baseExit <= baseEntry) baseExit += 24 * 60 * 60 * 1000;
+      const safeMargin = Math.min(credentials.margin_seconds, Math.floor((baseExit - baseEntry - 1000) / 2000));
+      entryAt = addRandomMargin(baseEntry, safeMargin);
+      exitAt = addRandomMargin(baseExit, safeMargin);
+    }
+    statements.push(env.DB.prepare(
+      `INSERT INTO calendar_days (user_id, local_date, label, entry_time, exit_time, random_entry_at, random_exit_at, margin_seconds, synced_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, local_date) DO UPDATE SET label=excluded.label, entry_time=excluded.entry_time, exit_time=excluded.exit_time,
+       random_entry_at=excluded.random_entry_at, random_exit_at=excluded.random_exit_at, margin_seconds=excluded.margin_seconds, synced_at=excluded.synced_at`,
+    ).bind(user.id, day.localDate, day.label, day.entryTime, day.exitTime, entryAt, exitAt, samePlan ? old.margin_seconds : credentials.margin_seconds, now));
+    // Replace imported marks only for dates confirmed by this complete response.
+    // This also removes old false punches parsed from future schedule labels.
+    statements.push(env.DB.prepare("DELETE FROM punch_events WHERE user_id = ? AND local_date = ? AND source != 'automatic'")
+      .bind(user.id, day.localDate));
+  }
   for (const event of remoteEvents) {
+    statements.push(env.DB.prepare("UPDATE punch_guards SET status = 'confirmed' WHERE user_id = ? AND local_date = ? AND action = ? AND status = 'uncertain'")
+      .bind(user.id, event.localDate, event.action));
     const matched = automatic.results.find((candidate) =>
       candidate.local_date === event.localDate && candidate.action === event.action && minute(candidate.recorded_time) === minute(event.time));
     if (matched) {
@@ -101,11 +139,56 @@ async function syncHistory(env: Env, user: SessionUser) {
     } else {
       statements.push(env.DB.prepare(
         "INSERT OR IGNORE INTO punch_events (id, user_id, job_id, local_date, action, source, recorded_time, created_at) VALUES (?, ?, NULL, ?, ?, 'manual', ?, ?)",
-      ).bind(crypto.randomUUID(), user.id, event.localDate, event.action, event.time, now));
+      ).bind(`timenet:${user.id}:${event.remoteId}`, user.id, event.localDate, event.action, event.time, now));
     }
   }
-  for (let offset = 0; offset < statements.length; offset += 50) await env.DB.batch(statements.slice(offset, offset + 50));
-  return json({ ok: true, imported: remoteEvents.length, message: `Historial sincronizado: ${remoteEvents.length} fichajes encontrados.` });
+  // Keep replacement atomic: failed imports must preserve the previous history.
+  await env.DB.batch(statements);
+  await env.DB.prepare("UPDATE manual_punch_requests SET status = 'reviewed', updated_at = ? WHERE user_id = ? AND (status = 'uncertain' OR (status = 'running' AND created_at < ?))")
+    .bind(now, user.id, now - 5 * 60_000).run();
+  return json({ ok: true, imported: remoteEvents.length, message: `Calendario sincronizado: ${snapshot.days.length} días y ${remoteEvents.length} fichajes reales.` });
+}
+
+async function manualPunch(request: Request, env: Env, user: SessionUser) {
+  const body = await bodyAsObject(request);
+  if (body.action !== "entry" && body.action !== "exit") return error("Elige entrada o salida.");
+  if (typeof body.requestId !== "string" || !/^[\da-f-]{36}$/i.test(body.requestId)) return error("Petición de fichaje no válida.");
+  const existing = await env.DB.prepare("SELECT action, response FROM manual_punch_requests WHERE id = ? AND user_id = ?")
+    .bind(body.requestId, user.id).first<{ action: string; response: string | null }>();
+  if (existing) {
+    if (existing.action !== body.action) return error("La petición ya se usó para otro fichaje.", 409);
+    return existing.response ? json(JSON.parse(existing.response)) : error("Hay un fichaje en curso. Sincroniza antes de repetir.", 409);
+  }
+  const now = Date.now();
+  const acquired = await env.DB.prepare("INSERT OR IGNORE INTO manual_punch_requests (id, user_id, action, status, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?)")
+    .bind(body.requestId, user.id, body.action, now, now).run();
+  if (!acquired.meta.changes) return error("Hay un fichaje pendiente de confirmar. Sincroniza Timenet antes de continuar.", 409);
+  const credentials = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(user.id).first<UserRow>();
+  let result: PunchResult;
+  try {
+    if (!credentials) throw new Error("Usuario no encontrado.");
+    const pin = await decryptSecret(credentials.pin_ciphertext, credentials.pin_iv, env.DATA_ENCRYPTION_KEY);
+    const action = body.action;
+    const date = localDate(now, credentials.time_zone);
+    result = await guardedPunch(env, user.id, date, action,
+      () => readTimenetHistory(env, pin),
+      () => punchTimenet(env, pin, action, date, true, credentials.time_zone));
+  } catch (cause) {
+    console.error("No se pudo iniciar el fichaje manual", cause);
+    result = { ok: false, message: "No se pudo conectar con Timenet. Vuelve a intentarlo.", code: "connection_failed" };
+  }
+  const finishedAt = Date.now();
+  const status = result.uncertain ? "uncertain" : !result.ok ? "failed" : result.skipped ? "skipped" : "success";
+  const updates = [env.DB.prepare("UPDATE manual_punch_requests SET status = ?, response = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+    .bind(status, JSON.stringify(result), finishedAt, body.requestId, user.id)];
+  if (result.ok && !result.skipped && result.time && credentials) {
+    updates.push(env.DB.prepare("INSERT INTO punch_events (id, user_id, job_id, local_date, action, source, recorded_time, created_at) VALUES (?, ?, NULL, ?, ?, 'manual', ?, ?)")
+      .bind(`manual:${body.requestId}`, user.id, localDate(finishedAt, credentials.time_zone), body.action, result.time, finishedAt));
+  }
+  await env.DB.batch(updates);
+  await env.DB.prepare("INSERT INTO notifications (id, user_id, level, title, message, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(crypto.randomUUID(), user.id, !result.ok ? "error" : result.skipped ? "info" : "success", !result.ok ? "Problema con el fichaje manual" : result.skipped ? "Fichaje manual omitido" : `Fichaje manual: ${body.action === "entry" ? "entrada" : "salida"}`, result.message, finishedAt).run();
+  return json(result);
 }
 
 function validateSchedule(value: unknown) {
@@ -184,11 +267,21 @@ async function adminHealth(env: Env) {
 async function route(request: Request, env: Env) {
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
-  if (method === "GET" && url.pathname === "/health") return json({ ok: true, service: "controlhorari-worker", time: Date.now() });
+  if (method === "GET" && url.pathname === "/health") return json({ ok: true, service: "controlhorari-worker", release: "2026-10-14-admin-setup-v2", time: Date.now() });
 
   if (method === "POST" && url.pathname === "/api/auth/login") {
     const body = await bodyAsObject(request);
-    const result = await login(env, stringField(body, "username"), stringField(body, "password"));
+    const username = stringField(body, "username").trim().toLowerCase();
+    const password = stringField(body, "password");
+    if (username.length > 254 || password.length > 256) return error("Usuario o contraseña incorrectos.", 401);
+    const now = Date.now();
+    const key = await sha256(username);
+    const allowance = await env.DB.prepare(`INSERT INTO login_limits (key, attempts, expires_at) VALUES (?, 1, ?)
+      ON CONFLICT(key) DO UPDATE SET attempts = CASE WHEN expires_at <= ? THEN 1 ELSE attempts + 1 END,
+      expires_at = CASE WHEN expires_at <= ? THEN excluded.expires_at ELSE expires_at END
+      WHERE expires_at <= ? OR attempts < 12`).bind(key, now + 15 * 60_000, now, now, now).run();
+    if (!allowance.meta.changes) return json({ ok: false, message: "Demasiados intentos. Vuelve a intentarlo en 15 minutos." }, 429, { "retry-after": "900" });
+    const result = await login(env, username, password);
     return result ? json({ ok: true, ...result }) : error("Usuario o contraseña incorrectos.", 401);
   }
   if (method === "POST" && url.pathname === "/api/auth/logout") {
@@ -199,8 +292,11 @@ async function route(request: Request, env: Env) {
   if (method === "POST" && url.pathname === "/api/admin/users") {
     const caller = await authenticate(request, env);
     const setupSecret = request.headers.get("x-admin-setup-secret");
-    const setupAuthorized = Boolean(env.ADMIN_SETUP_SECRET && setupSecret && await secureEqual(setupSecret, env.ADMIN_SETUP_SECRET));
-    if (caller?.role !== "admin" && !setupAuthorized) return error("No autorizado.", 403);
+    const existingUser = await env.DB.prepare("SELECT id FROM users LIMIT 1").first();
+    const setupAuthorized = !existingUser && Boolean(env.ADMIN_SETUP_SECRET && setupSecret && await secureEqual(setupSecret, env.ADMIN_SETUP_SECRET));
+    if (caller?.role !== "admin" && !setupAuthorized) {
+      return json({ ok: false, message: "No autorizado.", code: existingUser ? "setup_closed" : !env.ADMIN_SETUP_SECRET ? "setup_secret_missing" : "setup_secret_mismatch" }, 403);
+    }
     const body = await bodyAsObject(request);
     try {
       const created = await createUser(env, {
@@ -224,9 +320,36 @@ async function route(request: Request, env: Env) {
   }
 
   const user = await requireUser(request, env);
+  if (method === "GET" && url.pathname === "/api/me/push/config") return json({ ok: true, ...pushConfig(env) });
+  if (method === "POST" && url.pathname === "/api/me/push/status") {
+    const body = await bodyAsObject(request);
+    const sub = await env.DB.prepare("SELECT id FROM push_subscriptions WHERE user_id = ? AND endpoint = ?").bind(user.id, stringField(body, "endpoint")).first();
+    return json({ ok: true, subscribed: Boolean(sub) });
+  }
+  if (method === "POST" && url.pathname === "/api/me/push/subscribe") {
+    if (!pushConfig(env).configured) return error("Las notificaciones no están configuradas en el servidor.", 503);
+    const body = await bodyAsObject(request);
+    if (!validSubscription(body)) return error("Suscripción no válida.");
+    const count = await env.DB.prepare("SELECT COUNT(*) AS total FROM push_subscriptions WHERE user_id = ? AND endpoint != ?").bind(user.id, body.endpoint).first<{ total: number }>();
+    if ((count?.total ?? 0) >= 10) return error("Ya hay diez dispositivos registrados. Desactiva alguno primero.");
+    await env.DB.prepare("INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, p256dh=excluded.p256dh, auth=excluded.auth")
+      .bind(crypto.randomUUID(), user.id, body.endpoint, body.keys.p256dh, body.keys.auth, Date.now()).run();
+    return json({ ok: true });
+  }
+  if (method === "POST" && url.pathname === "/api/me/push/unsubscribe") {
+    const body = await bodyAsObject(request);
+    await env.DB.prepare("DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?").bind(user.id, stringField(body, "endpoint")).run();
+    return json({ ok: true });
+  }
+  if (method === "POST" && url.pathname === "/api/me/push/test") {
+    const body = await bodyAsObject(request);
+    try { await testPush(env, user.id, stringField(body, "endpoint")); return json({ ok: true }); }
+    catch (cause) { return error(cause instanceof Error ? cause.message : "No se pudo enviar la prueba.", 502); }
+  }
   if (method === "GET" && url.pathname === "/api/me") return json(await dashboard(env, user));
   if (method === "PUT" && url.pathname === "/api/me/config") return updateConfig(request, env, user);
   if (method === "POST" && url.pathname === "/api/me/history/sync") return syncHistory(env, user);
+  if (method === "POST" && url.pathname === "/api/me/punch") return manualPunch(request, env, user);
   if (method === "POST" && url.pathname === "/api/me/notifications/read") {
     await env.DB.prepare("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL").bind(Date.now(), user.id).run();
     return json({ ok: true });
@@ -258,21 +381,23 @@ function corsHeaders(request: Request, env: Env): Record<string, string> {
 }
 
 export default {
-  async fetch(request, env): Promise<Response> {
+  async fetch(request, env, context): Promise<Response> {
     const cors = corsHeaders(request, env);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
     try {
       const response = await route(request, env);
+      context.waitUntil(flushPush(env).catch((cause) => console.error("No se pudieron procesar los avisos push", cause)));
       const headers = new Headers(response.headers);
       for (const [name, value] of Object.entries(cors)) headers.set(name, value);
       return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
     } catch (cause) {
       if (cause instanceof Response) return cause;
+      if (cause instanceof TimenetError) return error(cause.message, cause.status);
       console.error(cause);
       return error("Error interno del servidor.", 500);
     }
   },
   async scheduled(_controller, env, context): Promise<void> {
-    context.waitUntil(runScheduler(env));
+    context.waitUntil(runScheduler(env).finally(() => flushPush(env)));
   },
 } satisfies ExportedHandler<Env>;
