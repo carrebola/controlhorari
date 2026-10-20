@@ -1,5 +1,5 @@
 import { decryptSecret } from "./crypto";
-import { addRandomMargin, localDate, localParts, weekdayForLocalDate, zonedDateTimeToEpoch } from "./time";
+import { configuredPunchPlan, localDate, localParts, weekdayForLocalDate } from "./time";
 import { punchTimenet, readTimenetHistory } from "./timenet";
 import { guardedPunch } from "./punch-guard";
 import type { CalendarDayRow, Env, JobRow, ScheduleRow, UserRow } from "./types";
@@ -39,17 +39,26 @@ async function ensureTodayJobs(env: Env, now: number) {
     const weekday = weekdayForLocalDate(parts);
     const schedule = await env.DB.prepare("SELECT * FROM schedules WHERE user_id = ? AND weekday = ? AND enabled = 1")
       .bind(user.id, weekday).first<ScheduleRow>();
-    if (calendar ? !calendar.entry_time || !calendar.exit_time : !schedule) continue;
-    const entry = calendar?.entry_time ?? schedule!.entry_time;
-    const exit = calendar?.exit_time ?? schedule!.exit_time;
-    for (const [action, configuredTime, calendarTarget] of [["entry", entry, calendar?.random_entry_at], ["exit", exit, calendar?.random_exit_at]] as const) {
-      const targetAt = calendarTarget ?? addRandomMargin(zonedDateTimeToEpoch(parts, `${configuredTime}:00`, user.time_zone), user.margin_seconds);
+    const plan = configuredPunchPlan(parts, user.time_zone, schedule, user.margin_seconds, calendar);
+    if (!plan) {
+      await env.DB.prepare("UPDATE jobs SET status = 'skipped', error_code = 'non_working_day', updated_at = ? WHERE user_id = ? AND local_date = ? AND status = 'scheduled' AND attempt_count = 0 AND target_at > ?")
+        .bind(now, user.id, date, now).run();
+      continue;
+    }
+    if (calendar) {
+      await env.DB.prepare("UPDATE calendar_days SET random_entry_at = ?, random_exit_at = ?, margin_seconds = ?, plan_key = ? WHERE user_id = ? AND local_date = ?")
+        .bind(plan.entryAt, plan.exitAt, user.margin_seconds, plan.key, user.id, date).run();
+    }
+    for (const [action, targetAt] of [["entry", plan.entryAt], ["exit", plan.exitAt]] as const) {
       const result = await env.DB.prepare(
         `INSERT OR IGNORE INTO jobs
          (id, user_id, local_date, action, target_at, planned_at, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)`,
       ).bind(crypto.randomUUID(), user.id, date, action, targetAt, targetAt, now, now).run();
       created += result.meta.changes;
+      // Only revise future, untouched work; never replay an attempted punch.
+      if (calendar) await env.DB.prepare("UPDATE jobs SET target_at = ?, planned_at = ?, updated_at = ? WHERE user_id = ? AND local_date = ? AND action = ? AND status = 'scheduled' AND attempt_count = 0 AND target_at > ? AND planned_at != ?")
+        .bind(targetAt, targetAt, now, user.id, date, action, now, targetAt).run();
     }
   }
   return { usersScanned: users.results.length, jobsCreated: created };

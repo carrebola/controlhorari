@@ -54,6 +54,7 @@ export interface CalendarDayRow {
   exit_time: string | null;
   random_entry_at: number | null;
   random_exit_at: number | null;
+  plan_key: string | null;
   margin_seconds: number;
   synced_at: number;
 }
