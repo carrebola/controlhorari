@@ -18,10 +18,11 @@ export async function guardedPunch(
   const acquired = await env.DB.prepare("INSERT OR IGNORE INTO punch_guards (user_id, local_date, action, token, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)")
     .bind(userId, date, action, token, Date.now()).run();
   if (!acquired.meta.changes) {
-    const guard = await env.DB.prepare("SELECT status FROM punch_guards WHERE user_id = ? AND local_date = ? AND action = ?")
-      .bind(userId, date, action).first<{ status: string }>();
-    if (guard?.status === "confirmed") return duplicate();
-    return { ok: false, uncertain: true, code: "punch_locked", message: "Hay un fichaje en curso o pendiente de revisión. No se enviará otro." };
+    const guard = await env.DB.prepare("SELECT status, action FROM punch_guards WHERE user_id = ? AND local_date = ? AND (action = ? OR status IN ('pending', 'uncertain')) ORDER BY CASE WHEN status IN ('pending', 'uncertain') THEN 0 ELSE 1 END LIMIT 1")
+      .bind(userId, date, action).first<{ status: string; action: string }>();
+    if (guard?.status === "confirmed" && guard.action === action) return duplicate();
+    if (guard?.status === "pending") return { ok: false, code: "punch_in_progress", message: "Ya hay un fichaje en curso para hoy. Espera a que termine." };
+    return { ok: false, uncertain: true, code: "punch_locked", message: "Hay un fichaje de hoy pendiente de revisión. No se enviará otro." };
   }
   let attempted = false;
   try {

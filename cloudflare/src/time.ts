@@ -79,3 +79,22 @@ export function addRandomMargin(epochMs: number, marginSeconds: number) {
   const offset = Number(bytes[0] % (marginSeconds * 2 + 1)) - marginSeconds;
   return epochMs + offset * 1000;
 }
+
+export function configuredPunchPlan(
+  date: Pick<LocalDateParts, "year" | "month" | "day">,
+  timeZone: string,
+  schedule: { enabled: number; entry_time: string; exit_time: string } | null | undefined,
+  marginSeconds: number,
+  calendar: { entry_time: string | null; exit_time: string | null; plan_key?: string | null; random_entry_at: number | null; random_exit_at: number | null } | null | undefined,
+) {
+  if (!schedule?.enabled || (calendar && (!calendar.entry_time || !calendar.exit_time))) return null;
+  const key = JSON.stringify([schedule.entry_time, schedule.exit_time, marginSeconds, timeZone]);
+  if (calendar?.plan_key === key && calendar.random_entry_at !== null && calendar.random_exit_at !== null) {
+    return { key, entryAt: calendar.random_entry_at, exitAt: calendar.random_exit_at };
+  }
+  const entry = zonedDateTimeToEpoch(date, schedule.entry_time, timeZone);
+  let exit = zonedDateTimeToEpoch(date, schedule.exit_time, timeZone);
+  if (exit <= entry) exit += 24 * 60 * 60 * 1000;
+  const margin = Math.min(marginSeconds, Math.floor((exit - entry - 1000) / 2000));
+  return { key, entryAt: addRandomMargin(entry, margin), exitAt: addRandomMargin(exit, margin) };
+}

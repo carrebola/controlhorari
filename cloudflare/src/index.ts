@@ -4,7 +4,7 @@ import { runScheduler } from "./scheduler";
 import { guardedPunch } from "./punch-guard";
 import { flushPush, pushConfig, testPush, validSubscription } from "./push";
 import { punchTimenet, readTimenetHistory, TimenetError, type PunchResult } from "./timenet";
-import { addRandomMargin, localDate, zonedDateTimeToEpoch } from "./time";
+import { configuredPunchPlan, localDate, weekdayForLocalDate } from "./time";
 import type { CalendarDayRow, Env, ScheduleRow, SessionUser, UserRow } from "./types";
 
 type JsonRecord = Record<string, unknown>;
@@ -95,6 +95,7 @@ async function syncHistory(env: Env, user: SessionUser) {
   const snapshot = await readTimenetHistory(env, pin);
   const remoteEvents = snapshot.events;
   const previous = await env.DB.prepare("SELECT * FROM calendar_days WHERE user_id = ?").bind(user.id).all<CalendarDayRow>();
+  const schedules = await env.DB.prepare("SELECT * FROM schedules WHERE user_id = ?").bind(user.id).all<ScheduleRow>();
   const automatic = await env.DB.prepare(
     "SELECT id, job_id, local_date, action, recorded_time FROM punch_events WHERE user_id = ? AND source = 'automatic'",
   ).bind(user.id).all<{ id: string; job_id: string | null; local_date: string; action: string; recorded_time: string }>();
@@ -105,25 +106,26 @@ async function syncHistory(env: Env, user: SessionUser) {
   const dateKey = (date: string) => date.split("/").reverse().join("-");
   for (const day of snapshot.days) {
     const old = previous.results.find((row) => row.local_date === day.localDate);
-    const samePlan = old && old.entry_time === day.entryTime && old.exit_time === day.exitTime;
-    let entryAt = samePlan ? old.random_entry_at : null;
-    let exitAt = samePlan ? old.random_exit_at : null;
-    if (day.entryTime && day.exitTime && dateKey(day.localDate) >= dateKey(today) && (!samePlan || entryAt === null || exitAt === null)) {
-      const [d, m, y] = day.localDate.split("/").map(Number);
-      const parts = { day: d, month: m, year: y };
-      const baseEntry = zonedDateTimeToEpoch(parts, day.entryTime, credentials.time_zone);
-      let baseExit = zonedDateTimeToEpoch(parts, day.exitTime, credentials.time_zone);
-      if (baseExit <= baseEntry) baseExit += 24 * 60 * 60 * 1000;
-      const safeMargin = Math.min(credentials.margin_seconds, Math.floor((baseExit - baseEntry - 1000) / 2000));
-      entryAt = addRandomMargin(baseEntry, safeMargin);
-      exitAt = addRandomMargin(baseExit, safeMargin);
-    }
+    const [d, m, y] = day.localDate.split("/").map(Number);
+    const parts = { day: d, month: m, year: y };
+    const upcoming = dateKey(day.localDate) >= dateKey(today);
+    const schedule = schedules.results.find((row) => row.weekday === weekdayForLocalDate(parts));
+    const plan = upcoming ? configuredPunchPlan(parts, credentials.time_zone, schedule, credentials.margin_seconds,
+      { ...old, entry_time: day.entryTime, exit_time: day.exitTime, random_entry_at: old?.random_entry_at ?? null, random_exit_at: old?.random_exit_at ?? null }) : null;
+    const entryAt = upcoming ? plan?.entryAt ?? null : old?.random_entry_at ?? null;
+    const exitAt = upcoming ? plan?.exitAt ?? null : old?.random_exit_at ?? null;
     statements.push(env.DB.prepare(
-      `INSERT INTO calendar_days (user_id, local_date, label, entry_time, exit_time, random_entry_at, random_exit_at, margin_seconds, synced_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO calendar_days (user_id, local_date, label, entry_time, exit_time, random_entry_at, random_exit_at, margin_seconds, synced_at, plan_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(user_id, local_date) DO UPDATE SET label=excluded.label, entry_time=excluded.entry_time, exit_time=excluded.exit_time,
-       random_entry_at=excluded.random_entry_at, random_exit_at=excluded.random_exit_at, margin_seconds=excluded.margin_seconds, synced_at=excluded.synced_at`,
-    ).bind(user.id, day.localDate, day.label, day.entryTime, day.exitTime, entryAt, exitAt, samePlan ? old.margin_seconds : credentials.margin_seconds, now));
+       random_entry_at=excluded.random_entry_at, random_exit_at=excluded.random_exit_at, margin_seconds=excluded.margin_seconds, synced_at=excluded.synced_at, plan_key=excluded.plan_key`,
+    ).bind(user.id, day.localDate, day.label, day.entryTime, day.exitTime, entryAt, exitAt, upcoming ? credentials.margin_seconds : old?.margin_seconds ?? credentials.margin_seconds, now, upcoming ? plan?.key ?? null : old?.plan_key ?? null));
+    if (upcoming && plan) {
+      for (const [action, target] of [["entry", plan.entryAt], ["exit", plan.exitAt]] as const) {
+        statements.push(env.DB.prepare("UPDATE jobs SET target_at = ?, planned_at = ?, updated_at = ? WHERE user_id = ? AND local_date = ? AND action = ? AND status = 'scheduled' AND attempt_count = 0 AND target_at > ?")
+          .bind(target, target, now, user.id, day.localDate, action, now));
+      }
+    }
     // Replace imported marks only for dates confirmed by this complete response.
     // This also removes old false punches parsed from future schedule labels.
     statements.push(env.DB.prepare("DELETE FROM punch_events WHERE user_id = ? AND local_date = ? AND source != 'automatic'")
@@ -160,16 +162,16 @@ async function manualPunch(request: Request, env: Env, user: SessionUser) {
     return existing.response ? json(JSON.parse(existing.response)) : error("Hay un fichaje en curso. Sincroniza antes de repetir.", 409);
   }
   const now = Date.now();
-  const acquired = await env.DB.prepare("INSERT OR IGNORE INTO manual_punch_requests (id, user_id, action, status, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?)")
-    .bind(body.requestId, user.id, body.action, now, now).run();
-  if (!acquired.meta.changes) return error("Hay un fichaje pendiente de confirmar. Sincroniza Timenet antes de continuar.", 409);
   const credentials = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(user.id).first<UserRow>();
+  if (!credentials) return error("Usuario no encontrado.", 404);
+  const date = localDate(now, credentials.time_zone);
+  const acquired = await env.DB.prepare("INSERT OR IGNORE INTO manual_punch_requests (id, user_id, action, local_date, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'running', ?, ?)")
+    .bind(body.requestId, user.id, body.action, date, now, now).run();
+  if (!acquired.meta.changes) return error("Hay un fichaje pendiente de confirmar. Sincroniza Timenet antes de continuar.", 409);
   let result: PunchResult;
   try {
-    if (!credentials) throw new Error("Usuario no encontrado.");
     const pin = await decryptSecret(credentials.pin_ciphertext, credentials.pin_iv, env.DATA_ENCRYPTION_KEY);
     const action = body.action;
-    const date = localDate(now, credentials.time_zone);
     result = await guardedPunch(env, user.id, date, action,
       () => readTimenetHistory(env, pin),
       () => punchTimenet(env, pin, action, date, true, credentials.time_zone));
@@ -211,11 +213,19 @@ async function updateConfig(request: Request, env: Env, user: SessionUser) {
   const margin = Number(body.marginSeconds);
   if (!Number.isInteger(margin) || margin < 0 || margin > 3600) return error("El margen debe estar entre 0 y 3600 segundos.");
   const schedules = validateSchedule(body.schedules);
+  const oldUser = await env.DB.prepare("SELECT margin_seconds FROM users WHERE id = ?").bind(user.id).first<{ margin_seconds: number }>();
+  const oldSchedules = await env.DB.prepare("SELECT * FROM schedules WHERE user_id = ?").bind(user.id).all<ScheduleRow>();
+  const planChanged = oldUser?.margin_seconds !== margin || schedules.some((day) => {
+    const old = oldSchedules.results.find((row) => row.weekday === day.weekday);
+    return !old || Boolean(old.enabled) !== day.enabled || old.entry_time !== day.entry || old.exit_time !== day.exit;
+  });
   const now = Date.now();
   const statements: D1PreparedStatement[] = [
     env.DB.prepare("UPDATE users SET enabled = ?, margin_seconds = ?, updated_at = ? WHERE id = ?")
       .bind(enabled ? 1 : 0, margin, now, user.id),
   ];
+  if (planChanged) statements.push(env.DB.prepare("DELETE FROM jobs WHERE user_id = ? AND (status = 'scheduled' OR (status = 'skipped' AND error_code = 'non_working_day')) AND attempt_count = 0 AND target_at > ?")
+    .bind(user.id, now));
   if (!enabled) {
     statements.push(
       env.DB.prepare("UPDATE jobs SET status = 'skipped', error_code = 'disabled', updated_at = ? WHERE user_id = ? AND status = 'scheduled' AND target_at > ?")
