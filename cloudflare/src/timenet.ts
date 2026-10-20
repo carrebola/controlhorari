@@ -21,7 +21,13 @@ export class TimenetError extends Error {
 }
 
 export async function punchTimenet(env: Env, pin: string, action: JobAction, localDate: string, manual = false, timeZone: string = env.TIME_ZONE, beforeClick?: () => Promise<boolean>): Promise<PunchResult> {
-  const browser = await puppeteer.launch(env.BROWSER);
+  let browser: Awaited<ReturnType<typeof puppeteer.launch>>;
+  try {
+    browser = await puppeteer.launch(env.BROWSER);
+  } catch (cause) {
+    console.error("No se pudo iniciar el navegador de fichaje", cause);
+    return { ok: false, uncertain: false, code: "browser_unavailable", message: "No se pudo iniciar el navegador de Timenet. No se ha enviado ningún fichaje." };
+  }
   let clicked = false;
   try {
     const page = await browser.newPage();

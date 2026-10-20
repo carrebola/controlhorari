@@ -160,16 +160,16 @@ async function manualPunch(request: Request, env: Env, user: SessionUser) {
     return existing.response ? json(JSON.parse(existing.response)) : error("Hay un fichaje en curso. Sincroniza antes de repetir.", 409);
   }
   const now = Date.now();
-  const acquired = await env.DB.prepare("INSERT OR IGNORE INTO manual_punch_requests (id, user_id, action, status, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?)")
-    .bind(body.requestId, user.id, body.action, now, now).run();
-  if (!acquired.meta.changes) return error("Hay un fichaje pendiente de confirmar. Sincroniza Timenet antes de continuar.", 409);
   const credentials = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(user.id).first<UserRow>();
+  if (!credentials) return error("Usuario no encontrado.", 404);
+  const date = localDate(now, credentials.time_zone);
+  const acquired = await env.DB.prepare("INSERT OR IGNORE INTO manual_punch_requests (id, user_id, action, local_date, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'running', ?, ?)")
+    .bind(body.requestId, user.id, body.action, date, now, now).run();
+  if (!acquired.meta.changes) return error("Hay un fichaje pendiente de confirmar. Sincroniza Timenet antes de continuar.", 409);
   let result: PunchResult;
   try {
-    if (!credentials) throw new Error("Usuario no encontrado.");
     const pin = await decryptSecret(credentials.pin_ciphertext, credentials.pin_iv, env.DATA_ENCRYPTION_KEY);
     const action = body.action;
-    const date = localDate(now, credentials.time_zone);
     result = await guardedPunch(env, user.id, date, action,
       () => readTimenetHistory(env, pin),
       () => punchTimenet(env, pin, action, date, true, credentials.time_zone));

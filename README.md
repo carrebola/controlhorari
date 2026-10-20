@@ -92,6 +92,7 @@ Importa el repositorio y añade `WORKER_API_URL` con la URL pública del Worker,
 - Al abrir la app, iniciar sesión, volver desde segundo plano o recuperar conexión, se sincroniza Timenet antes de dar por actualizado el estado de hoy. Durante la consulta o si falla, los botones manuales quedan bloqueados y se indica que los datos guardados no están actualizados. Las consultas simultáneas se agrupan y se conservan los cambios de configuración aún sin guardar.
 - La sincronización lee el horario y los registros reales por separado. Los horarios futuros no se importan como fichajes. Las horas aleatorias quedan guardadas y el programador reutiliza ese cálculo; no se inventan cálculos para días pasados sin planificación guardada.
 - Cuando existe calendario sincronizado para un día, el programador utiliza ese horario y omite los días sin turno. Si no se ha sincronizado, utiliza el horario semanal configurado. Los turnos partidos quedan sin automatizar hasta contar con soporte para varias franjas.
+- Los bloqueos pendientes o inciertos pertenecen a un usuario y un día concretos. Un bloqueo antiguo se conserva para revisión pero no impide fichar en fechas posteriores. Un fallo al iniciar el navegador no implica que se haya pulsado el botón y permite un reintento seguro. La migración `0008_daily_punch_locks.sql` es obligatoria antes de desplegar esta corrección.
 
 ## Instalación móvil y notificaciones
 
@@ -109,7 +110,7 @@ El modo sin conexión muestra una pantalla informativa: no guarda páginas con d
 
 Antes de publicar, configura `WORKER_API_URL` con la URL HTTPS del Worker en Vercel y `APP_ORIGIN` con el dominio real de la interfaz en Cloudflare. La interfaz devuelve un error de configuración si falta `WORKER_API_URL` en producción. El proxy declara un máximo de 120 segundos; confirma que el plan de alojamiento lo permite.
 
-Aplica todas las migraciones, incluidas `0003`–`0007`, antes de desplegar el nuevo Worker. Verifica los secretos de autenticación/cifrado y VAPID, y conserva la clave de cifrado existente para poder leer los PIN ya guardados. El secreto de alta inicial solo permite crear usuarios mientras la base está vacía; después hace falta una sesión administradora. El acceso está limitado a doce intentos por usuario cada quince minutos.
+Aplica todas las migraciones, incluidas `0003`–`0008`, antes de desplegar el nuevo Worker. Verifica los secretos de autenticación/cifrado y VAPID, y conserva la clave de cifrado existente para poder leer los PIN ya guardados. El secreto de alta inicial solo permite crear usuarios mientras la base está vacía; después hace falta una sesión administradora. El acceso está limitado a doce intentos por usuario cada quince minutos.
 
 La prueba de aceptación pendiente tras el despliegue es instalarla en un móvil real, activar avisos y comprobar **Probar** con la app cerrada. El desarrollo local no demuestra entrega en iOS/Android ni confirma la configuración del cron remoto. No despliegues la cuenta local de prueba ni sus credenciales a producción.
 
