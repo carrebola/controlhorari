@@ -2,6 +2,7 @@ import puppeteer, { type ElementHandle } from "@cloudflare/puppeteer";
 import type { Env, JobAction } from "./types";
 import { localClock, localDate as currentLocalDate } from "./time";
 import { parseTimenetHistory } from "./timenet-history";
+import { observePunchOutcome } from "./timenet-confirmation";
 
 export interface PunchResult {
   ok: boolean;
@@ -93,12 +94,22 @@ export async function punchTimenet(env: Env, pin: string, action: JobAction, loc
     if (beforeClick && !(await beforeClick())) return { ok: true, skipped: true, code: "disabled", message: "La automatización se ha pausado; no se ha enviado el fichaje." };
     clicked = true;
     await button.click();
-    await page.waitForFunction(
-      (expected) => document.body.innerText.split("\n").some((line) => line.trim() === "treballant") === expected,
+    const outcomeHandle = await page.waitForFunction(
+      observePunchOutcome,
       { timeout: 15_000 },
       action === "entry",
     );
+    const outcome = await outcomeHandle.jsonValue();
+    await outcomeHandle.dispose();
     await buttonHandle.dispose();
+    if (outcome === "duplicate_confirmation") {
+      return {
+        ok: false,
+        uncertain: false,
+        code: "duplicate_confirmation_required",
+        message: "Timenet pide confirmar un fichaje del mismo tipo que el anterior. No se ha aceptado ni enviado la repetición. Revisa el historial de Timenet.",
+      };
+    }
     return {
       ok: true,
       time: localClock(Date.now(), timeZone),

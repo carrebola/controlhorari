@@ -150,7 +150,7 @@ async function processJob(env: Env, job: DueJob) {
     return { success: true };
   }
 
-  const canRetry = !result.uncertain && result.code !== "invalid_pin" && job.attempt_count < 2;
+  const canRetry = !result.uncertain && result.code !== "invalid_pin" && result.code !== "duplicate_confirmation_required" && job.attempt_count < 2;
   const status = result.uncertain ? "uncertain" : canRetry ? "scheduled" : "failed";
   const nextTarget = canRetry ? executedAt + 60_000 : job.target_at;
   const statements: D1PreparedStatement[] = [
