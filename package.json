@@ -13,7 +13,8 @@
     "cf:migrate:remote": "wrangler d1 migrations apply DB --remote --config cloudflare/wrangler.jsonc",
     "cf:deploy": "wrangler deploy --config cloudflare/wrangler.jsonc",
     "push:setup": "node scripts/setup-push.cjs",
-    "test:push:worker": "node scripts/push-worker-check.cjs"
+    "test:push:worker": "node scripts/push-worker-check.cjs",
+    "test:today": "node scripts/check-auto-today.cjs"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.5.0",

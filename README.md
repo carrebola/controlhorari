@@ -89,6 +89,7 @@ Importa el repositorio y añade `WORKER_API_URL` con la URL pública del Worker,
 - El panel Monitor muestra latencia, ciclos del programador y fallos recientes.
 - **Sincronizar Timenet** importa las marcas y distingue las que coinciden con trabajos automáticos; el resto se marca como manual.
 - El resumen agrupa los datos por día: entrada/salida previstas en el calendario de Timenet, horas automáticas calculadas con margen aleatorio, registros manuales/externos y registros automáticos confirmados por esta aplicación. Se conservan todos los fichajes si hay varias entradas o salidas.
+- Al abrir la app, iniciar sesión, volver desde segundo plano o recuperar conexión, se sincroniza Timenet antes de dar por actualizado el estado de hoy. Durante la consulta o si falla, los botones manuales quedan bloqueados y se indica que los datos guardados no están actualizados. Las consultas simultáneas se agrupan y se conservan los cambios de configuración aún sin guardar.
 - La sincronización lee el horario y los registros reales por separado. Los horarios futuros no se importan como fichajes. Las horas aleatorias quedan guardadas y el programador reutiliza ese cálculo; no se inventan cálculos para días pasados sin planificación guardada.
 - Cuando existe calendario sincronizado para un día, el programador utiliza ese horario y omite los días sin turno. Si no se ha sincronizado, utiliza el horario semanal configurado. Los turnos partidos quedan sin automatizar hasta contar con soporte para varias franjas.
 

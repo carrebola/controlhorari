@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { Activity, ArrowDownLeft, ArrowUpRight, Bell, CalendarClock, CheckCircle2, Clock3, House, LogOut, RefreshCcw, Save, Settings, ShieldAlert, XCircle } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -23,13 +23,17 @@ type Dashboard = { ok: true; profile: Profile; schedules: Schedule[]; jobs: Job[
 type AdminHealth = { ok: true; latestRuns: SchedulerRun[]; statusCounts: { status: string; count: number }[]; users: { total: number; enabled: number }; recentFailures: Array<Job & { username: string; display_name: string }> };
 type AdminUser = { id: string; username: string; display_name: string; role: Role; enabled: number; created_at: number };
 
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
 const dayNames = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
 const statusLabels: Record<JobStatus, string> = { scheduled: "Programado", claimed: "Preparando", running: "Ejecutando", success: "Correcto", failed: "Fallido", uncertain: "Revisar", skipped: "Omitido", missed: "No ejecutado" };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api/backend${path}`, { ...init, headers: { "content-type": "application/json", ...(init?.headers || {}) }, cache: "no-store" });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.message || "No se pudo completar la petición.");
+  if (!response.ok) throw new ApiError(data.message || "No se pudo completar la petición.", response.status);
   return data as T;
 }
 
@@ -53,6 +57,10 @@ export default function Home() {
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [refreshingToday, setRefreshingToday] = useState(false);
+  const [todayFresh, setTodayFresh] = useState(false);
+  const todayRequest = useRef<Promise<void> | null>(null);
+  const sessionGeneration = useRef(0);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [tab, setTab] = useState<Tab>("home");
@@ -77,13 +85,50 @@ export default function Home() {
     finally { setLoading(false); }
   }, [applyDashboard]);
 
-  useEffect(() => {
-    api<Dashboard>("/me")
-      .then((data) => { applyDashboard(data); if (new URLSearchParams(window.location.search).get("view") === "notifications") setTab("notifications"); })
-      .catch((cause) => { if (cause instanceof Error && !/Sesión no válida/.test(cause.message)) setError(cause.message); })
-      .finally(() => setLoading(false));
-    if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js", { scope: "/", updateViaCache: "none" });
+  const refreshToday = useCallback((initial = false): Promise<void> => {
+    if (todayRequest.current) return todayRequest.current;
+    const generation = sessionGeneration.current;
+    const current = () => sessionGeneration.current === generation;
+    const request = (async () => {
+      setRefreshingToday(true); setTodayFresh(false); setError("");
+      let saved: Dashboard | null = null;
+      try {
+        // Check the session before opening Timenet. Do not show stale today's
+        // records as current while the remote check is still running.
+        saved = await api<Dashboard>("/me");
+        if (!current()) return;
+        await api("/me/history/sync", { method: "POST", body: "{}" });
+        const latest = await api<Dashboard>("/me");
+        if (!current()) return;
+        if (initial) applyDashboard(latest); else { setDashboard(latest); setEnabled(Boolean(latest.profile.enabled)); }
+        setTodayFresh(true); setNeedsReview(false);
+      } catch (cause) {
+        if (!current()) return;
+        if (cause instanceof ApiError && cause.status === 401) { setDashboard(null); return; }
+        if (initial && saved) applyDashboard(saved);
+        setError(`No se pudo actualizar el estado de hoy. ${saved ? "Se muestran los últimos datos guardados. " : ""}${cause instanceof Error ? cause.message : "Vuelve a sincronizar."}`);
+      } finally {
+        if (current()) { setRefreshingToday(false); setLoading(false); }
+      }
+    })();
+    todayRequest.current = request;
+    void request.finally(() => { if (todayRequest.current === request) todayRequest.current = null; });
+    return request;
   }, [applyDashboard]);
+
+  useEffect(() => {
+    void refreshToday(true).then(() => { if (new URLSearchParams(window.location.search).get("view") === "notifications") setTab("notifications"); });
+    if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js", { scope: "/", updateViaCache: "none" });
+  }, [refreshToday]);
+  useEffect(() => {
+    if (!dashboard?.profile.id) return;
+    const resume = () => { if (document.visibilityState === "visible" && !busy) void refreshToday(); };
+    const restored = (event: PageTransitionEvent) => { if (event.persisted) resume(); };
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("pageshow", restored);
+    window.addEventListener("online", resume);
+    return () => { document.removeEventListener("visibilitychange", resume); window.removeEventListener("pageshow", restored); window.removeEventListener("online", resume); };
+  }, [dashboard?.profile.id, busy, refreshToday]);
   useEffect(() => {
     if (tab !== "monitor" || dashboard?.profile.role !== "admin") return;
     void Promise.all([api<AdminHealth>("/admin/health"), api<{ ok: true; users: AdminUser[] }>("/admin/users")])
@@ -96,12 +141,13 @@ export default function Home() {
 
   async function signIn(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError("");
-    try { await api("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }); setPassword(""); await refresh(); }
+    try { await api("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }); setPassword(""); await refreshToday(true); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "No se pudo iniciar sesión."); }
     finally { setBusy(false); }
   }
 
   async function signOut() {
+    sessionGeneration.current++; todayRequest.current = null; setRefreshingToday(false); setTodayFresh(false);
     await removeDevicePush().catch(() => { /* Logout still clears the session if the device is offline. */ });
     setBusy(true); try { await api("/auth/logout", { method: "POST", body: "{}" }); } catch { /* The proxy still clears the local cookie. */ }
     setDashboard(null); setBusy(false); setTab("home"); setNeedsReview(false);
@@ -138,16 +184,11 @@ export default function Home() {
   async function markNotificationsRead() { await api("/me/notifications/read", { method: "POST", body: "{}" }); await refresh(); }
 
   async function syncHistory() {
-    setBusy(true); setError(""); setMessage("");
-    try {
-      const result = await api<{ ok: true; message: string }>("/me/history/sync", { method: "POST", body: "{}" });
-      setMessage(result.message); setNeedsReview(false); await refresh();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "No se pudo sincronizar Timenet."); }
-    finally { setBusy(false); }
+    setMessage(""); await refreshToday();
   }
 
   async function manualPunch(action: "entry" | "exit") {
-    if (busy || needsReview) return;
+    if (busy || needsReview || refreshingToday || !todayFresh) return;
     setBusy(true); setPunching(action); setError(""); setMessage("");
     try {
       const result = await api<{ ok: boolean; uncertain?: boolean; message: string }>("/me/punch", { method: "POST", body: JSON.stringify({ action, requestId: crypto.randomUUID() }) });
@@ -171,7 +212,7 @@ export default function Home() {
     finally { setBusy(false); }
   }
 
-  if (loading) return <main className="grid min-h-dvh place-items-center bg-zinc-50"><p role="status" className="text-sm text-zinc-600">Conectando con el servidor…</p></main>;
+  if (loading) return <main className="grid min-h-dvh place-items-center bg-zinc-50"><p role="status" className="text-sm text-zinc-600">Actualizando el estado de hoy…</p></main>;
 
   if (!dashboard) return <main className="min-h-dvh bg-zinc-50 px-4 py-10 text-zinc-950"><div className="mx-auto max-w-sm"><div className="mb-8 flex items-center gap-3"><div className="rounded-2xl bg-emerald-700 p-3 text-white"><Clock3 className="h-7 w-7" /></div><div><p className="text-sm text-zinc-500">FP Llefià · Timenet</p><h1 className="text-2xl font-semibold">Control Horari</h1></div></div><section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm"><h2 className="text-lg font-semibold">Acceder</h2><p className="mt-1 text-sm text-zinc-500">Consulta tus fichajes y controla la automatización.</p><form className="mt-6 space-y-4" onSubmit={signIn}><div><Label htmlFor="username">Usuario</Label><Input id="username" autoComplete="username" className="mt-1 h-12" required value={username} onChange={(event) => setUsername(event.target.value)} /></div><div><Label htmlFor="password">Contraseña</Label><Input id="password" type="password" autoComplete="current-password" className="mt-1 h-12" required value={password} onChange={(event) => setPassword(event.target.value)} /></div><Button className="h-12 w-full" disabled={busy}>{busy ? "Accediendo…" : "Entrar"}</Button></form>{error && <p role="alert" className="mx-4 mt-2 shrink-0 rounded-2xl bg-red-50 p-3 text-xs text-red-800">{error}</p>}</section></div></main>;
 
@@ -186,7 +227,7 @@ export default function Home() {
       <div className="min-w-0"><p className="truncate text-[11px] text-zinc-500">{dashboard.profile.display_name}</p><h1 className="whitespace-nowrap text-xl font-bold tracking-tight">Mi jornada<span className="text-emerald-600">.</span></h1></div>
       <div className="flex shrink-0 items-center gap-1">
         <button type="button" role="switch" aria-label="Fichaje automático" title={dashboard.profile.enabled ? "Pausar fichaje automático" : "Activar fichaje automático"} aria-checked={Boolean(dashboard.profile.enabled)} disabled={busy} onClick={() => void toggleAutomation()} className="flex min-h-11 w-16 touch-manipulation flex-col items-center justify-center gap-1 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 disabled:opacity-50"><span className={`relative block h-7 w-12 rounded-full transition-colors ${dashboard.profile.enabled ? "bg-emerald-600" : "bg-zinc-300"}`}><span className={`absolute left-1 top-1 h-5 w-5 rounded-full bg-white shadow-sm transition-transform motion-reduce:transition-none ${dashboard.profile.enabled ? "translate-x-5" : "translate-x-0"}`} /></span><span className={`text-[9px] font-semibold ${dashboard.profile.enabled ? "text-emerald-700" : "text-zinc-500"}`}>Auto {dashboard.profile.enabled ? "ON" : "OFF"}</span></button>
-        <Button className="h-11 w-11 rounded-full bg-zinc-50" variant="ghost" size="icon" title="Sincronizar Timenet" aria-label="Sincronizar Timenet" disabled={busy} onClick={() => void syncHistory()}><RefreshCcw className={`h-5 w-5 ${busy ? "animate-spin" : ""}`} /></Button>
+        <Button className="h-11 w-11 rounded-full bg-zinc-50" variant="ghost" size="icon" title="Sincronizar Timenet" aria-label="Sincronizar Timenet" disabled={busy || refreshingToday} onClick={() => void syncHistory()}><RefreshCcw className={`h-5 w-5 ${busy || refreshingToday ? "animate-spin" : ""}`} /></Button>
         <Button className="h-11 w-11 rounded-full" variant="ghost" size="icon" title="Cerrar sesión" aria-label="Cerrar sesión" onClick={() => void signOut()} disabled={busy}><LogOut className="h-4 w-4" /></Button>
       </div>
     </header>
@@ -194,14 +235,14 @@ export default function Home() {
 
     <div className={`min-h-0 flex-1 px-4 ${tab === "summary" || tab === "home" ? "flex flex-col overflow-hidden" : "overflow-y-auto overscroll-contain"}`}>
     {tab === "home" && <section className="flex min-h-0 flex-1 flex-col gap-3 pt-4 pb-3">
-      <div className="shrink-0"><h2 className="text-xl font-bold tracking-tight">Hoy</h2><p className="mt-1 text-xs text-zinc-500">Tu jornada de un vistazo</p></div>
+      <div className="shrink-0"><h2 className="text-xl font-bold tracking-tight">Hoy</h2><p role="status" className="mt-1 text-xs text-zinc-500">{refreshingToday ? "Actualizando desde Timenet…" : todayFresh ? "Estado actualizado desde Timenet" : "Estado sin actualizar · sincroniza para continuar"}</p></div>
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain rounded-xl">
         <DailyPunches calendar={dashboard.calendar ?? []} events={dashboard.events} jobs={dashboard.jobs} timeZone={dashboard.profile.time_zone} enabled={Boolean(dashboard.profile.enabled)} todayOnly />
       </div>
       <div className="shrink-0 space-y-2">
         <div className="grid grid-cols-2 gap-3">
-          <button type="button" disabled={busy || needsReview || entryRecorded} onClick={() => void manualPunch("entry")} className="flex min-h-24 touch-manipulation flex-col items-center justify-center gap-2 rounded-3xl bg-emerald-800 p-4 text-white shadow-sm transition-colors active:bg-emerald-900 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-emerald-300"><ArrowDownLeft aria-hidden="true" className="h-7 w-7" /><span className="text-sm font-semibold">{punching === "entry" ? "Fichando…" : entryRecorded ? "Entrada registrada" : "Fichar entrada"}</span></button>
-          <button type="button" disabled={busy || needsReview || exitRecorded} onClick={() => void manualPunch("exit")} className="flex min-h-24 touch-manipulation flex-col items-center justify-center gap-2 rounded-3xl bg-rose-50 p-4 text-rose-800 ring-1 ring-inset ring-rose-100 transition-colors active:bg-rose-100 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-rose-300"><ArrowUpRight aria-hidden="true" className="h-7 w-7" /><span className="text-sm font-semibold">{punching === "exit" ? "Fichando…" : exitRecorded ? "Salida registrada" : "Fichar salida"}</span></button>
+          <button type="button" disabled={busy || refreshingToday || !todayFresh || needsReview || entryRecorded} onClick={() => void manualPunch("entry")} className="flex min-h-24 touch-manipulation flex-col items-center justify-center gap-2 rounded-3xl bg-emerald-800 p-4 text-white shadow-sm transition-colors active:bg-emerald-900 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-emerald-300"><ArrowDownLeft aria-hidden="true" className="h-7 w-7" /><span className="text-sm font-semibold">{punching === "entry" ? "Fichando…" : entryRecorded ? "Entrada registrada" : "Fichar entrada"}</span></button>
+          <button type="button" disabled={busy || refreshingToday || !todayFresh || needsReview || exitRecorded} onClick={() => void manualPunch("exit")} className="flex min-h-24 touch-manipulation flex-col items-center justify-center gap-2 rounded-3xl bg-rose-50 p-4 text-rose-800 ring-1 ring-inset ring-rose-100 transition-colors active:bg-rose-100 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-rose-300"><ArrowUpRight aria-hidden="true" className="h-7 w-7" /><span className="text-sm font-semibold">{punching === "exit" ? "Fichando…" : exitRecorded ? "Salida registrada" : "Fichar salida"}</span></button>
         </div>
         <p className="text-center text-[11px] text-zinc-500">{needsReview ? "Sincroniza para revisar el último fichaje antes de continuar." : "Fichaje manual en Timenet · se registra al pulsar"}</p>
       </div>
