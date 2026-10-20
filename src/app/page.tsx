@@ -62,6 +62,7 @@ export default function Home() {
   const [refreshingToday, setRefreshingToday] = useState(false);
   const [todayFresh, setTodayFresh] = useState(false);
   const todayRequest = useRef<Promise<void> | null>(null);
+  const historyLoaded = useRef(false);
   const sessionGeneration = useRef(0);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -87,7 +88,7 @@ export default function Home() {
     finally { setLoading(false); }
   }, [applyDashboard]);
 
-  const refreshToday = useCallback((initial = false): Promise<void> => {
+  const refreshToday = useCallback((initial = false, full = false): Promise<void> => {
     if (todayRequest.current) return todayRequest.current;
     const generation = sessionGeneration.current;
     const current = () => sessionGeneration.current === generation;
@@ -95,14 +96,31 @@ export default function Home() {
       setRefreshingToday(true); setTodayFresh(false); setError("");
       let saved: Dashboard | null = null;
       try {
-        // Check the session before opening Timenet. Do not show stale today's
-        // records as current while the remote check is still running.
-        saved = await api<Dashboard>("/me");
+        // Paint the small saved snapshot immediately, with manual actions locked
+        // until the remote check completes. History is loaded only on demand.
+        if (initial) {
+          saved = await api<Dashboard>("/me/today");
+          if (!current()) return;
+          applyDashboard(saved); setLoading(false);
+        }
+        let latest: Dashboard;
+        if (full) {
+          await api("/me/history/sync", { method: "POST", body: "{}" });
+          latest = await api<Dashboard>("/me");
+          historyLoaded.current = true;
+        } else latest = await api<Dashboard>("/me/today/sync", { method: "POST", body: "{}" });
         if (!current()) return;
-        await api("/me/history/sync", { method: "POST", body: "{}" });
-        const latest = await api<Dashboard>("/me");
-        if (!current()) return;
-        if (initial) applyDashboard(latest); else { setDashboard(latest); setEnabled(Boolean(latest.profile.enabled)); }
+        if (initial) applyDashboard(latest); else {
+          setDashboard((previous) => {
+            if (!previous || full) return latest;
+            const date = new Intl.DateTimeFormat("en-GB", { timeZone: latest.profile.time_zone }).format(new Date());
+            return { ...latest,
+              calendar: [...previous.calendar.filter((row) => row.local_date !== date), ...latest.calendar],
+              events: [...previous.events.filter((row) => row.local_date !== date), ...latest.events],
+              jobs: [...previous.jobs.filter((row) => row.local_date !== date), ...latest.jobs] };
+          });
+          setEnabled(Boolean(latest.profile.enabled));
+        }
         setTodayFresh(true); setNeedsReview(false);
       } catch (cause) {
         if (!current()) return;
@@ -117,6 +135,25 @@ export default function Home() {
     void request.finally(() => { if (todayRequest.current === request) todayRequest.current = null; });
     return request;
   }, [applyDashboard]);
+
+  useEffect(() => {
+    if (tab !== "summary" || !dashboard?.profile.id || historyLoaded.current) return;
+    let cancelled = false;
+    const generation = sessionGeneration.current;
+    void api<Dashboard>("/me").then((data) => {
+      if (cancelled || generation !== sessionGeneration.current) return;
+      historyLoaded.current = true;
+      setDashboard((previous) => {
+        if (!previous) return data;
+        const date = new Intl.DateTimeFormat("en-GB", { timeZone: previous.profile.time_zone }).format(new Date());
+        return { ...previous,
+          calendar: [...data.calendar.filter((row) => row.local_date !== date), ...previous.calendar.filter((row) => row.local_date === date)],
+          events: [...data.events.filter((row) => row.local_date !== date), ...previous.events.filter((row) => row.local_date === date)],
+          jobs: [...data.jobs.filter((row) => row.local_date !== date), ...previous.jobs.filter((row) => row.local_date === date)] };
+      });
+    }).catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause.message : "No se pudo cargar el histórico."); });
+    return () => { cancelled = true; };
+  }, [tab, dashboard?.profile.id]);
 
   useEffect(() => {
     void refreshToday(true).then(() => { if (new URLSearchParams(window.location.search).get("view") === "notifications") setTab("notifications"); });
@@ -149,6 +186,7 @@ export default function Home() {
   }
 
   async function signOut() {
+    historyLoaded.current = false;
     sessionGeneration.current++; todayRequest.current = null; setRefreshingToday(false); setTodayFresh(false);
     await removeDevicePush().catch(() => { /* Logout still clears the session if the device is offline. */ });
     setBusy(true); try { await api("/auth/logout", { method: "POST", body: "{}" }); } catch { /* The proxy still clears the local cookie. */ }
@@ -186,7 +224,7 @@ export default function Home() {
   async function markNotificationsRead() { await api("/me/notifications/read", { method: "POST", body: "{}" }); await refresh(); }
 
   async function syncHistory() {
-    setMessage(""); await refreshToday();
+    setMessage(""); await refreshToday(false, true);
   }
 
   async function manualPunch(action: "entry" | "exit") {
@@ -237,7 +275,8 @@ export default function Home() {
 
     <div className={`app-content min-h-0 flex-1 px-4 ${tab === "summary" || tab === "home" ? "flex flex-col overflow-hidden" : "overflow-y-auto overscroll-contain"}`}>
     {tab === "home" && <section className="flex min-h-0 flex-1 flex-col gap-3 pt-4 pb-3">
-      {(refreshingToday || !todayFresh) && <p role="status" className="shrink-0 text-sm text-zinc-600">{refreshingToday ? "Actualizando desde Timenet…" : "Estado sin actualizar · sincroniza para continuar"}</p>}
+      {refreshingToday && <span role="status" className="sr-only">Actualizando desde Timenet…</span>}
+      {!refreshingToday && !todayFresh && <p role="status" className="shrink-0 text-sm text-zinc-600">Estado sin actualizar · sincroniza para continuar</p>}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain rounded-xl">
         <DailyPunches calendar={dashboard.calendar ?? []} events={dashboard.events} jobs={dashboard.jobs} timeZone={dashboard.profile.time_zone} enabled={Boolean(dashboard.profile.enabled)} todayOnly />
       </div>
@@ -259,7 +298,7 @@ export default function Home() {
       </div>
     </section>}
 
-    {tab === "notifications" && <section className="py-5"><div className="mb-4 flex items-center justify-between"><div><h2 className="text-lg font-semibold">Avisos</h2><p className="text-sm text-zinc-500">Resultados y problemas de los fichajes.</p></div>{unread > 0 && <Button variant="secondary" onClick={() => void markNotificationsRead()}>Marcar leídos</Button>}</div><div className="space-y-3">{dashboard.notifications.map((notice) => <article key={notice.id} className={`rounded-xl border bg-white p-4 ${notice.read_at ? "border-zinc-200" : "border-emerald-300"}`}><div className="flex gap-3">{notice.level === "success" ? <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" /> : notice.level === "error" ? <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" /> : <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />}<div><p className="font-medium">{notice.title}</p><p className="mt-1 text-sm text-zinc-600">{notice.message}</p><p className="mt-2 text-xs text-zinc-400">{timeLabel(notice.created_at)}</p></div></div></article>)}{!dashboard.notifications.length && <p className="rounded-xl border border-dashed border-zinc-300 p-5 text-sm text-zinc-500">No hay avisos.</p>}</div></section>}
+    {tab === "notifications" && <section className="py-5"><div className="mb-4 flex items-center justify-between"><div><h2 className="text-lg font-semibold">Avisos</h2><p className="text-sm text-zinc-500">Resultados y problemas de los fichajes.</p></div>{unread > 0 && <Button variant="secondary" onClick={() => void markNotificationsRead()}>Marcar leídos</Button>}</div><div className="space-y-3">{dashboard.notifications.map((notice) => <article key={notice.id} className={`rounded-xl border p-4 ${notice.level === "error" ? "border-rose-200 bg-rose-50/60" : notice.level === "warning" ? "border-amber-200 bg-amber-50/60" : notice.level === "success" ? "border-emerald-200 bg-emerald-50/60" : "border-zinc-200 bg-white"}`}><div className="flex gap-3">{notice.level === "success" ? <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" /> : notice.level === "error" ? <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" /> : <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />}<div><p className="font-medium">{notice.title}</p><p className="mt-1 text-sm text-zinc-600">{notice.message}</p><p className="mt-2 text-xs text-zinc-400">{timeLabel(notice.created_at)}</p></div></div></article>)}{!dashboard.notifications.length && <p className="rounded-xl border border-dashed border-zinc-300 p-5 text-sm text-zinc-500">No hay avisos.</p>}</div></section>}
 
     <MobileSetup visible={tab === "settings"} />
     {tab === "settings" && <section className="py-5"><div className="mb-5"><h2 className="text-lg font-semibold">Configuración</h2><p className="text-sm text-zinc-500">Los cambios se guardan en el servidor y funcionan aunque el móvil esté apagado.</p></div><form className="space-y-4 pb-4" onSubmit={saveConfiguration}><div className="rounded-xl border border-zinc-200 bg-white p-4"><Label htmlFor="margin">Margen aleatorio (± segundos)</Label><p className="mt-1 text-sm text-zinc-500">Se aplica al horario semanal que eliges debajo.</p><Input id="margin" className="mt-2 h-11" type="number" inputMode="numeric" min={0} max={3600} value={margin} onChange={(event) => setMargin(Number(event.target.value))} /></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><Label htmlFor="new-pin">Cambiar PIN de Timenet</Label><Input id="new-pin" className="mt-2 h-11" type="password" inputMode="numeric" autoComplete="off" placeholder="Déjalo vacío para conservarlo" value={newPin} onChange={(event) => setNewPin(event.target.value.replace(/\D/g, ""))} /></div><div className="space-y-3"><h3 className="font-semibold">Horario semanal</h3>{schedules.map((day, index) => <div key={day.weekday} className="rounded-xl border border-zinc-200 bg-white p-4"><MobileSwitch label={`Automatizar ${dayNames[day.weekday]}`} checked={Boolean(day.enabled)} onChange={() => setSchedules(schedules.map((value, position) => position === index ? { ...value, enabled: value.enabled ? 0 : 1 } : value))}><span className="block text-base font-semibold">{dayNames[day.weekday]}</span><span className="block text-sm text-zinc-500">{day.enabled ? "Fichaje automático" : "Sin automatización"}</span></MobileSwitch><div hidden={!day.enabled} className="mt-3 grid grid-cols-2 gap-3 border-t border-zinc-100 pt-3"><div><Label htmlFor={`entry-${day.weekday}`}>Entrada</Label><Input id={`entry-${day.weekday}`} className="mt-1 h-11" type="time" disabled={!day.enabled} value={day.entry_time} onChange={(event) => setSchedules(schedules.map((value, position) => position === index ? { ...value, entry_time: event.target.value } : value))} /></div><div><Label htmlFor={`exit-${day.weekday}`}>Salida</Label><Input id={`exit-${day.weekday}`} className="mt-1 h-11" type="time" disabled={!day.enabled} value={day.exit_time} onChange={(event) => setSchedules(schedules.map((value, position) => position === index ? { ...value, exit_time: event.target.value } : value))} /></div></div></div>)}</div><Button className="settings-save h-12 w-full" disabled={busy}><Save className="h-4 w-4" />{busy ? "Guardando…" : "Guardar configuración"}</Button></form></section>}
