@@ -1,2 +1,106 @@
-const assert=require('node:assert/strict');const {chromium}=require('playwright');
-(async()=>{const b=await chromium.launch({executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});try{const c=await b.newContext({viewport:{width:390,height:844},reducedMotion:'reduce'});const p=await c.newPage();const today=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',year:'numeric'}).format(new Date());let syncs=0;let fullReads=0;let fail=false;let finish;const gate=new Promise(r=>finish=r);let data={ok:true,profile:{id:'test',username:'test',display_name:'Prueba',role:'user',enabled:0,margin_seconds:60,time_zone:'Europe/Madrid'},schedules:Array.from({length:7},(_,weekday)=>({weekday,enabled:1,entry_time:'09:00',exit_time:'17:00'})),jobs:[],events:[],calendar:[{local_date:today,label:'09:00 a 17:00',entry_time:'09:00',exit_time:'17:00',random_entry_at:null,random_exit_at:null,margin_seconds:60,synced_at:Date.now()}],notifications:[],health:{latestRun:null,schedulerHealthy:false,last24Hours:null}};await p.route('**/api/backend/**',async route=>{const url=new URL(route.request().url());if(url.pathname.endsWith('/me/today/sync')){syncs++;if(syncs===1)await gate;if(fail)return route.fulfill({status:503,json:{message:'Timenet no disponible'}});data={...data,events:[{id:'entry',local_date:today,action:'entry',source:'manual',recorded_time:'09:01',created_at:Date.now()}]};return route.fulfill({json:data})}if(url.pathname.endsWith('/me')){fullReads++;return route.fulfill({json:data})}if(url.pathname.endsWith('/me/today'))return route.fulfill({json:data});if(url.pathname.endsWith('/push/config'))return route.fulfill({json:{ok:true,configured:false,publicKey:''}});return route.fulfill({json:{ok:true}})});await p.goto('http://localhost:3000');await p.getByText('Actualizando el estado de hoy…',{exact:true}).waitFor();await p.getByRole('button',{name:'Fichar entrada',exact:true}).waitFor();assert.equal(await p.getByRole('button',{name:'Fichar entrada',exact:true}).isDisabled(),true);finish();await p.getByRole('button',{name:'Entrada registrada',exact:true}).waitFor();assert.equal(syncs,1);assert.equal(fullReads,0);assert.equal(await p.getByRole('button',{name:'Entrada registrada',exact:true}).isDisabled(),true);console.log('SAVED_TODAY_PAINTS_BEFORE_SYNC_WITH_ACTIONS_LOCKED passed');await p.getByRole('button',{name:'Ajustes',exact:true}).click();await p.locator('#margin').fill('123');await p.evaluate(()=>{document.dispatchEvent(new Event('visibilitychange'));document.dispatchEvent(new Event('visibilitychange'))});await p.waitForFunction(()=>document.querySelector('button[aria-label="Sincronizar Timenet"]').disabled===false);assert.equal(await p.locator('#margin').inputValue(),'123');assert.equal(syncs,2);console.log('RESUME_DEDUPLICATES_AND_PRESERVES_DRAFTS passed');await p.getByRole('button',{name:'Inicio',exact:true}).click();fail=true;await p.evaluate(()=>window.dispatchEvent(new Event('online')));await p.getByText(/No se pudo actualizar el estado de hoy/).waitFor();assert.equal(await p.getByRole('button',{name:'Fichar salida',exact:true}).isDisabled(),true);console.log('FAILED_SYNC_BLOCKS_MANUAL_PUNCH passed');assert.equal(fullReads,0);const historyResponse=p.waitForResponse(r=>new URL(r.url()).pathname==='/api/backend/me');await p.getByRole('button',{name:'Fichajes',exact:true}).click();await historyResponse;assert.equal(fullReads,1);console.log('HISTORY_LOADED_ONLY_WHEN_OPENED passed');console.log('REAL_TIMENET_CALLS',0);}finally{await b.close()}})().catch(e=>{console.error(e.message);process.exitCode=1});
+const assert = require('node:assert/strict');
+const { chromium } = require('playwright');
+
+(async () => {
+  const b = await chromium.launch({ executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true });
+  try {
+    const c = await b.newContext({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce' });
+    const p = await c.newPage();
+    const today = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Madrid', day: '2-digit', month: '2-digit', year: 'numeric' }).format(new Date());
+    let syncs = 0;
+    let fullReads = 0;
+    let todayReads = 0;
+    let fail = false;
+    let finish;
+    const gate = new Promise((r) => { finish = r; });
+    let data = {
+      ok: true,
+      profile: { id: 'test', username: 'test', display_name: 'Prueba', role: 'user', enabled: 0, margin_seconds: 60, time_zone: 'Europe/Madrid' },
+      schedules: Array.from({ length: 7 }, (_, weekday) => ({ weekday, enabled: 1, entry_time: '09:00', exit_time: '17:00' })),
+      jobs: [],
+      events: [],
+      calendar: [{ local_date: today, label: '09:00 a 17:00', entry_time: '09:00', exit_time: '17:00', random_entry_at: null, random_exit_at: null, margin_seconds: 60, synced_at: Date.now() }],
+      notifications: [],
+      health: { latestRun: null, schedulerHealthy: false, last24Hours: null },
+    };
+    await p.route('**/api/backend/**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname.endsWith('/me/today/sync') || url.pathname.endsWith('/me/history/sync')) {
+        syncs++;
+        if (syncs === 1) await gate;
+        if (fail) return route.fulfill({ status: 503, json: { message: 'Timenet no disponible' } });
+        data = { ...data, events: [{ id: 'entry', local_date: today, action: 'entry', source: 'manual', recorded_time: '09:01', created_at: Date.now() }] };
+        return route.fulfill({ json: data });
+      }
+      if (url.pathname.endsWith('/me')) {
+        fullReads++;
+        return route.fulfill({ json: data });
+      }
+      if (url.pathname.endsWith('/me/today')) {
+        todayReads++;
+        return route.fulfill({ json: data });
+      }
+      if (url.pathname.endsWith('/push/config')) return route.fulfill({ json: { ok: true, configured: false, publicKey: '' } });
+      return route.fulfill({ json: { ok: true } });
+    });
+
+    await p.goto('http://localhost:3000');
+    await p.getByText('Actualizando el estado de hoy…', { exact: true }).waitFor();
+    await p.getByRole('button', { name: 'Fichar entrada', exact: true }).waitFor();
+    assert.equal(await p.getByRole('button', { name: 'Fichar entrada', exact: true }).isDisabled(), true);
+    finish();
+    await p.getByRole('button', { name: 'Entrada registrada', exact: true }).waitFor();
+    assert.equal(syncs, 1);
+    assert.equal(fullReads, 0);
+    assert.equal(await p.getByRole('button', { name: 'Entrada registrada', exact: true }).isDisabled(), true);
+    console.log('SAVED_TODAY_PAINTS_BEFORE_SYNC_WITH_ACTIONS_LOCKED passed');
+
+    const readsBeforeResume = todayReads;
+    await p.getByRole('button', { name: 'Ajustes', exact: true }).click({ force: true });
+    await p.locator('#margin').fill('123');
+    await p.evaluate(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await p.waitForFunction(() => document.querySelector('button[aria-label="Sincronizar Timenet"]')?.disabled === false);
+    assert.equal(await p.locator('#margin').inputValue(), '123');
+    assert.equal(syncs, 1);
+    assert.ok(todayReads >= readsBeforeResume);
+    console.log('RESUME_USES_CACHE_WITHOUT_TIMENET_SYNC passed');
+
+    // Keep verifying punch availability from the home tab without fighting the Next.js overlay.
+    await p.evaluate(() => {
+      const tab = Array.from(document.querySelectorAll('button')).find((button) => button.textContent?.trim() === 'Inicio');
+      tab?.click();
+    });
+    await p.getByRole('button', { name: 'Fichar salida', exact: true }).waitFor();
+    fail = true;
+    const syncsBeforeOnline = syncs;
+    await p.evaluate(() => window.dispatchEvent(new Event('online')));
+    await p.waitForTimeout(500);
+    assert.equal(syncs, syncsBeforeOnline);
+    assert.equal(await p.getByRole('button', { name: 'Fichar salida', exact: true }).isDisabled(), false);
+    console.log('ONLINE_RESUME_KEEPS_CACHED_PUNCH_STATE passed');
+
+    await p.evaluate(() => document.querySelector('button[aria-label="Sincronizar Timenet"]')?.click());
+    await p.getByText(/No se pudo/).waitFor();
+    assert.equal(await p.getByRole('button', { name: 'Fichar salida', exact: true }).isDisabled(), true);
+    console.log('FAILED_MANUAL_SYNC_BLOCKS_MANUAL_PUNCH passed');
+
+    assert.equal(fullReads, 0);
+    const historyResponse = p.waitForResponse((r) => new URL(r.url()).pathname === '/api/backend/me');
+    await p.evaluate(() => {
+      const tab = Array.from(document.querySelectorAll('button')).find((button) => button.textContent?.trim() === 'Fichajes');
+      tab?.click();
+    });
+    await historyResponse;
+    assert.equal(fullReads, 1);
+    console.log('HISTORY_LOADED_ONLY_WHEN_OPENED passed');
+    console.log('REAL_TIMENET_CALLS', 0);
+  } finally {
+    await b.close();
+  }
+})().catch((e) => {
+  console.error(e.message);
+  process.exitCode = 1;
+});
