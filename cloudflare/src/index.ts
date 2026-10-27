@@ -1,9 +1,8 @@
 import { authenticate, createUser, login, logout, type NewUserInput } from "./auth";
 import { decryptSecret, encryptSecret, secureEqual, sha256 } from "./crypto";
 import { runScheduler } from "./scheduler";
-import { guardedPunch } from "./punch-guard";
 import { flushPush, pushConfig, testPush, validSubscription } from "./push";
-import { punchTimenet, readTimenetHistory, TimenetError, type PunchResult } from "./timenet";
+import { guardedTimenetPunch, readTimenetHistory, TimenetError, type PunchResult } from "./timenet";
 import { configuredPunchPlan, localDate, weekdayForLocalDate } from "./time";
 import type { CalendarDayRow, Env, ScheduleRow, SessionUser, UserRow } from "./types";
 
@@ -137,11 +136,16 @@ async function syncHistory(env: Env, user: SessionUser, todayOnly = false) {
     const parts = { day: d, month: m, year: y };
     const upcoming = dateKey(day.localDate) >= dateKey(today);
     const schedule = schedules.results.find((row) => row.weekday === weekdayForLocalDate(parts));
-    const expectedKey = schedule?.enabled && day.entryTime && day.exitTime
-      ? JSON.stringify([schedule.entry_time, schedule.exit_time, credentials.margin_seconds, credentials.time_zone]) : null;
-    if (!todayOnly || !old || (upcoming && (old.plan_key !== expectedKey || (expectedKey && (old.random_entry_at === null || old.random_exit_at === null))))) {
-      const plan = upcoming ? configuredPunchPlan(parts, credentials.time_zone, schedule, credentials.margin_seconds,
-        { ...old, entry_time: day.entryTime, exit_time: day.exitTime, random_entry_at: old?.random_entry_at ?? null, random_exit_at: old?.random_exit_at ?? null }) : null;
+    const plan = upcoming ? configuredPunchPlan(parts, credentials.time_zone, schedule, credentials.margin_seconds, {
+      entry_time: day.entryTime,
+      exit_time: day.exitTime,
+      plan_key: old?.plan_key ?? null,
+      random_entry_at: old?.random_entry_at ?? null,
+      random_exit_at: old?.random_exit_at ?? null,
+    }) : null;
+    const planChanged = Boolean(upcoming && plan && (old?.plan_key !== plan.key || old.random_entry_at === null || old.random_exit_at === null));
+    // Always refresh Timenet previsto/label; only replace the saved monthly random plan when it changes.
+    if (!todayOnly || !old || upcoming) {
       const entryAt = upcoming ? plan?.entryAt ?? null : old?.random_entry_at ?? null;
       const exitAt = upcoming ? plan?.exitAt ?? null : old?.random_exit_at ?? null;
       statements.push(env.DB.prepare(
@@ -150,7 +154,7 @@ async function syncHistory(env: Env, user: SessionUser, todayOnly = false) {
          ON CONFLICT(user_id, local_date) DO UPDATE SET label=excluded.label, entry_time=excluded.entry_time, exit_time=excluded.exit_time,
          random_entry_at=excluded.random_entry_at, random_exit_at=excluded.random_exit_at, margin_seconds=excluded.margin_seconds, synced_at=excluded.synced_at, plan_key=excluded.plan_key`,
       ).bind(user.id, day.localDate, day.label, day.entryTime, day.exitTime, entryAt, exitAt, upcoming ? credentials.margin_seconds : old?.margin_seconds ?? credentials.margin_seconds, now, upcoming ? plan?.key ?? null : old?.plan_key ?? null));
-      if (upcoming && plan) {
+      if (planChanged && plan) {
         for (const [action, target] of [["entry", plan.entryAt], ["exit", plan.exitAt]] as const) {
           statements.push(env.DB.prepare("UPDATE jobs SET target_at = ?, planned_at = ?, updated_at = ? WHERE user_id = ? AND local_date = ? AND action = ? AND status = 'scheduled' AND attempt_count = 0 AND target_at > ?")
             .bind(target, target, now, user.id, day.localDate, action, now));
@@ -204,9 +208,10 @@ async function manualPunch(request: Request, env: Env, user: SessionUser) {
   try {
     const pin = await decryptSecret(credentials.pin_ciphertext, credentials.pin_iv, env.DATA_ENCRYPTION_KEY);
     const action = body.action;
-    result = await guardedPunch(env, user.id, date, action,
-      () => readTimenetHistory(env, pin),
-      () => punchTimenet(env, pin, action, date, true, credentials.time_zone));
+    result = await guardedTimenetPunch(env, user.id, pin, date, action, {
+      manual: true,
+      timeZone: credentials.time_zone,
+    });
   } catch (cause) {
     console.error("No se pudo iniciar el fichaje manual", cause);
     result = { ok: false, message: "No se pudo conectar con Timenet. Vuelve a intentarlo.", code: "connection_failed" };
@@ -223,6 +228,46 @@ async function manualPunch(request: Request, env: Env, user: SessionUser) {
   await env.DB.prepare("INSERT INTO notifications (id, user_id, level, title, message, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .bind(crypto.randomUUID(), user.id, !result.ok ? "error" : result.skipped ? "info" : "success", !result.ok ? "Problema con el fichaje manual" : result.skipped ? "Fichaje manual omitido" : `Fichaje manual: ${body.action === "entry" ? "entrada" : "salida"}`, result.message, finishedAt).run();
   return json(result);
+}
+
+async function resolveUncertainJob(request: Request, env: Env, user: SessionUser, jobId: string) {
+  const body = await bodyAsObject(request);
+  const resolution = stringField(body, "resolution");
+  const now = Date.now();
+
+  if (resolution === "confirmed") {
+    const recordedTime = stringField(body, "recordedTime");
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(recordedTime)) return error("Indica una hora válida para el fichaje.");
+    const update = await env.DB.prepare(
+      `UPDATE jobs SET status = 'success', timenet_time = ?, executed_at = ?, error_code = 'confirmed_by_user',
+       error_message = NULL, updated_at = ? WHERE id = ? AND user_id = ? AND status = 'uncertain'`,
+    ).bind(recordedTime, now, now, jobId, user.id).run();
+    if (!update.meta.changes) return error("Este fichaje ya se ha revisado o no existe.", 409);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO punch_events (id, user_id, job_id, local_date, action, source, recorded_time, created_at)
+         SELECT ?, user_id, id, local_date, action, 'automatic', ?, ? FROM jobs WHERE id = ? AND user_id = ? AND status = 'success' AND error_code = 'confirmed_by_user'`,
+      ).bind(crypto.randomUUID(), recordedTime, now, jobId, user.id),
+      env.DB.prepare(
+        "INSERT INTO notifications (id, user_id, level, title, message, job_id, created_at) VALUES (?, ?, 'success', ?, ?, ?, ?)",
+      ).bind(crypto.randomUUID(), user.id, "Fichaje confirmado", `Has confirmado que el fichaje se registró a las ${recordedTime}.`, jobId, now),
+    ]);
+    return json({ ok: true, message: "Fichaje confirmado y guardado en el historial." });
+  }
+
+  if (resolution === "retry") {
+    const update = await env.DB.prepare(
+      `UPDATE jobs SET status = 'scheduled', target_at = ?, reviewed_retry_used = 1, error_code = 'retry_authorized',
+       error_message = NULL, updated_at = ? WHERE id = ? AND user_id = ? AND status = 'uncertain' AND reviewed_retry_used = 0`,
+    ).bind(now, now, jobId, user.id).run();
+    if (!update.meta.changes) return error("Este fichaje ya se ha revisado o no admite otro intento.", 409);
+    await env.DB.prepare(
+      "INSERT INTO notifications (id, user_id, level, title, message, job_id, created_at) VALUES (?, ?, 'warning', ?, ?, ?, ?)",
+    ).bind(crypto.randomUUID(), user.id, "Reintento autorizado", "Has confirmado que el fichaje no se registró. Se realizará un último intento.", jobId, now).run();
+    return json({ ok: true, message: "Reintento autorizado. El servidor volverá a intentar el fichaje." });
+  }
+
+  return error("La resolución indicada no es válida.");
 }
 
 function validateSchedule(value: unknown) {
@@ -408,6 +453,8 @@ async function route(request: Request, env: Env) {
   if (method === "PUT" && url.pathname === "/api/me/config") return updateConfig(request, env, user);
   if (method === "POST" && url.pathname === "/api/me/history/sync") return syncHistory(env, user);
   if (method === "POST" && url.pathname === "/api/me/punch") return manualPunch(request, env, user);
+  const jobResolution = url.pathname.match(/^\/api\/me\/jobs\/([^/]+)\/resolve$/);
+  if (method === "POST" && jobResolution) return resolveUncertainJob(request, env, user, decodeURIComponent(jobResolution[1]));
   if (method === "POST" && url.pathname === "/api/me/notifications/read") {
     await env.DB.prepare("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL").bind(Date.now(), user.id).run();
     return json({ ok: true });

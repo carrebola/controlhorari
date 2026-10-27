@@ -1,7 +1,6 @@
 import { decryptSecret } from "./crypto";
 import { configuredPunchPlan, localDate, localParts, weekdayForLocalDate } from "./time";
-import { punchTimenet, readTimenetHistory } from "./timenet";
-import { guardedPunch } from "./punch-guard";
+import { guardedTimenetPunch } from "./timenet";
 import type { CalendarDayRow, Env, JobRow, ScheduleRow, UserRow } from "./types";
 
 const MISSED_AFTER_MS = 10 * 60 * 1000;
@@ -89,7 +88,7 @@ async function claimDueJobs(env: Env, now: number) {
   const due = await env.DB.prepare(
     `SELECT j.*, u.username, u.display_name, u.pin_ciphertext, u.pin_iv, u.time_zone
      FROM jobs j JOIN users u ON u.id = j.user_id
-     WHERE j.status = 'scheduled' AND j.target_at <= ? AND j.target_at >= ? AND u.enabled = 1
+     WHERE j.status = 'scheduled' AND j.target_at <= ? AND j.target_at >= ? AND (u.enabled = 1 OR j.error_code = 'retry_authorized')
      ORDER BY j.target_at ASC LIMIT ?`,
   ).bind(now, now - MISSED_AFTER_MS, MAX_JOBS_PER_RUN).all<DueJob>();
   const claimed: DueJob[] = [];
@@ -118,17 +117,15 @@ async function processJob(env: Env, job: DueJob) {
     return { success: false };
   }
 
-  const result = await guardedPunch(env, job.user_id, job.local_date, job.action,
-    () => readTimenetHistory(env, pin),
-    async () => {
-      const current = await env.DB.prepare("SELECT enabled FROM users WHERE id = ?").bind(job.user_id).first<{ enabled: number }>();
-      if (!current?.enabled) return { ok: true, skipped: true, code: "disabled", message: "La automatización se ha pausado; no se ha enviado el fichaje." };
-      if (localDate(Date.now(), job.time_zone) !== job.local_date) return { ok: true, skipped: true, code: "date_changed", message: "El día del fichaje ha terminado; no se ha enviado." };
-      return punchTimenet(env, pin, job.action, job.local_date, false, job.time_zone, async () => {
-        const latest = await env.DB.prepare("SELECT enabled FROM users WHERE id = ?").bind(job.user_id).first<{ enabled: number }>();
-        return Boolean(latest?.enabled);
-      });
-    });
+  const result = await guardedTimenetPunch(env, job.user_id, pin, job.local_date, job.action, {
+    manual: false,
+    timeZone: job.time_zone,
+    beforeClick: async () => {
+      const latest = await env.DB.prepare("SELECT enabled FROM users WHERE id = ?").bind(job.user_id).first<{ enabled: number }>();
+      if (!latest?.enabled) return false;
+      return localDate(Date.now(), job.time_zone) === job.local_date;
+    },
+  });
   const executedAt = Date.now();
   if (result.ok) {
     const status = result.skipped ? "skipped" : "success";
