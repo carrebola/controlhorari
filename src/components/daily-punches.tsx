@@ -70,7 +70,7 @@ export function DailyPunches({ calendar, events, jobs, timeZone, enabled, todayO
   return <div className="space-y-2.5">
     {!todayOnly && <><details className="rounded-2xl border border-zinc-200 bg-white px-4 text-sm text-zinc-600">
       <summary className="flex min-h-12 cursor-pointer items-center font-medium text-zinc-700">Cómo leer los horarios</summary>
-      <p className="mt-2 leading-relaxed">Calendario: horario previsto por Timenet. Aleatorio: horario de fichaje guardado (entrada 10 min antes y salida 10 min después del previsto, más tu margen ±); se recalcula cada mes. Manual: registro manual/externo. Automático: fichaje confirmado por esta aplicación.</p>
+      <p className="mt-2 leading-relaxed">Calendario: horario previsto por Timenet. Aleatorio: horario de fichaje guardado (entrada 10 min antes y salida 10 min después del previsto, más tu margen ±); se recalcula al guardar la configuración en días aún sin fichar, y cada mes. Manual: registro manual/externo. Automático: fichaje confirmado por esta aplicación.</p>
       <p className="mt-1 leading-relaxed">El origen de los registros externos se muestra como manual porque esta aplicación no puede confirmar cómo se realizaron. Los días pasados sin cálculo guardado muestran —.</p>
     </details>
     {!enabled && <p className="flex items-center gap-2 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800"><Pause aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />Automatización pausada · cálculo solo orientativo</p>}
