@@ -89,6 +89,38 @@ body {
 .daily-card-featured .summary-times svg { width: 18px; height: 18px; margin-right: 4px; }
 .daily-card-featured .summary-empty { color: #9f1239; }
 .daily-card-featured .summary-pending { display: block; margin-top: 4px; font-size: .75rem; font-weight: 500; letter-spacing: normal; color: #71717a; }
+.day-swipe {
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+  position: relative;
+}
+.day-swipe-track {
+  display: flex;
+  width: 300%;
+  height: 100%;
+  will-change: transform;
+  touch-action: pan-y;
+}
+.day-swipe-panel {
+  box-sizing: border-box;
+  width: 33.333333%;
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-inline: 2px;
+}
+.daily-card-festive { min-height: 220px; }
+.home-day-actions {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 136px;
+}
+.home-day-actions-alt { min-height: 136px; }
+/* Override global button manipulation so horizontal swipes reach the day browser. */
+.day-swipe button, .day-swipe [role="button"] { touch-action: pan-y; }
 .settings-save { position: sticky; bottom: 8px; box-shadow: 0 0 0 8px #f4f7f6, 0 4px 12px #12372a20; }
 button, input, select, summary { touch-action: manipulation; }
 button:focus-visible, summary:focus-visible, select:focus-visible { outline: 2px solid #047857; outline-offset: 3px; }
@@ -115,7 +147,8 @@ button:focus-visible, summary:focus-visible, select:focus-visible { outline: 2px
 }
 
 @media (max-height: 560px) {
-  .punch-action { min-height: 64px; flex-direction: row; padding: 12px; }
+  .punch-action { height: 64px; min-height: 64px; flex-direction: row; gap: 8px; padding: 12px; }
+  .home-day-actions, .home-day-actions-alt { min-height: 104px; }
   .app-tabbar button { min-height: 48px; flex-direction: row; }
 }
 
