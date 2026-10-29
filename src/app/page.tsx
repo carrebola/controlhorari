@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Activity, ArrowDownLeft, ArrowUpRight, Bell, CalendarClock, CheckCircle2, Clock3, House, Loader2, LogOut, RefreshCcw, Save, Settings, ShieldAlert, XCircle } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -10,6 +11,7 @@ import { Label } from "@/components/ui/label";
 import { MobileSwitch } from "@/components/ui/mobile-switch";
 import { DailyPunches } from "@/components/daily-punches";
 import { MobileSetup, removeDevicePush } from "@/components/mobile-setup";
+import { dateKey, shiftLocalDate } from "@/lib/local-date";
 
 type Role = "user" | "admin";
 type Tab = "home" | "summary" | "notifications" | "settings" | "monitor";
@@ -71,6 +73,14 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("home");
   const [punching, setPunching] = useState<"entry" | "exit" | null>(null);
   const [needsReview, setNeedsReview] = useState(false);
+  const [viewDate, setViewDate] = useState<string | null>(null);
+  const daySwipeCleanup = useRef<(() => void) | null>(null);
+  const browseHomeDayRef = useRef<(delta: -1 | 1, commit?: boolean) => Promise<boolean>>(async () => false);
+  const commitHomeDayRef = useRef<(delta: -1 | 1) => void>(() => {});
+  const dashboardRef = useRef<Dashboard | null>(null);
+  const viewDateRef = useRef<string | null>(null);
+  dashboardRef.current = dashboard;
+  viewDateRef.current = viewDate;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [enabled, setEnabled] = useState(false);
@@ -120,16 +130,18 @@ export default function Home() {
           historyLoaded.current = true;
         } else latest = await api<Dashboard>("/me/today/sync", { method: "POST", body: "{}" });
         if (!current()) return;
-        if (initial) applyDashboard(latest); else {
-          setDashboard((previous) => {
-            if (!previous || full) return latest;
-            const date = new Intl.DateTimeFormat("en-GB", { timeZone: latest.profile.time_zone, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date());
-            return { ...latest,
-              calendar: [...previous.calendar.filter((row) => row.local_date !== date), ...latest.calendar],
-              events: [...previous.events.filter((row) => row.local_date !== date), ...latest.events],
-              jobs: [...previous.jobs.filter((row) => row.local_date !== date), ...latest.jobs] };
-          });
-          setEnabled(Boolean(latest.profile.enabled));
+        setDashboard((previous) => {
+          if (!previous || full) return latest;
+          const date = new Intl.DateTimeFormat("en-GB", { timeZone: latest.profile.time_zone, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date());
+          return { ...latest,
+            calendar: [...previous.calendar.filter((row) => row.local_date !== date), ...latest.calendar],
+            events: [...previous.events.filter((row) => row.local_date !== date), ...latest.events],
+            jobs: [...previous.jobs.filter((row) => row.local_date !== date), ...latest.jobs] };
+        });
+        setEnabled(Boolean(latest.profile.enabled));
+        if (initial) {
+          setMargin(latest.profile.margin_seconds);
+          setSchedules(latest.schedules);
         }
         todayFreshRef.current = true;
         setTodayFresh(true); setNeedsReview(false);
@@ -152,24 +164,244 @@ export default function Home() {
     return request;
   }, [applyDashboard]);
 
+  const mergeHistoryPreservingToday = useCallback((data: Dashboard, previous: Dashboard | null) => {
+    if (!previous) return data;
+    const date = new Intl.DateTimeFormat("en-GB", { timeZone: previous.profile.time_zone, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date());
+    return {
+      ...previous,
+      calendar: [...data.calendar.filter((row) => row.local_date !== date), ...previous.calendar.filter((row) => row.local_date === date)],
+      events: [...data.events.filter((row) => row.local_date !== date), ...previous.events.filter((row) => row.local_date === date)],
+      jobs: [...data.jobs.filter((row) => row.local_date !== date), ...previous.jobs.filter((row) => row.local_date === date)],
+    };
+  }, []);
+
+  const ensureHistoryLoaded = useCallback(async () => {
+    if (historyLoaded.current) return dashboardRef.current;
+    const data = await api<Dashboard>("/me");
+    historyLoaded.current = true;
+    const merged = mergeHistoryPreservingToday(data, dashboardRef.current);
+    dashboardRef.current = merged;
+    setDashboard(merged);
+    return merged;
+  }, [mergeHistoryPreservingToday]);
+
+  const browseHomeDay = useCallback(async (delta: -1 | 1, commit = true) => {
+    let snapshot: Dashboard | null;
+    try {
+      snapshot = await ensureHistoryLoaded();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "No se pudo cargar el histórico.");
+      return false;
+    }
+    snapshot = snapshot ?? dashboardRef.current;
+    if (!snapshot) return false;
+    const todayDate = new Intl.DateTimeFormat("en-GB", { timeZone: snapshot.profile.time_zone, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date());
+    const current = viewDateRef.current ?? todayDate;
+    const next = shiftLocalDate(current, delta);
+    const bounds = [...snapshot.calendar.map((day) => day.local_date), todayDate]
+      .map(dateKey)
+      .sort((a, b) => a.localeCompare(b));
+    if (!bounds.length) return false;
+    const key = dateKey(next);
+    if (key < bounds[0] || key > bounds[bounds.length - 1]) return false;
+    if (commit) setViewDate(next === todayDate ? null : next);
+    return true;
+  }, [ensureHistoryLoaded]);
+  browseHomeDayRef.current = browseHomeDay;
+  commitHomeDayRef.current = (delta) => {
+    const snapshot = dashboardRef.current;
+    if (!snapshot) return;
+    const todayDate = new Intl.DateTimeFormat("en-GB", { timeZone: snapshot.profile.time_zone, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date());
+    const current = viewDateRef.current ?? todayDate;
+    const next = shiftLocalDate(current, delta);
+    setViewDate(next === todayDate ? null : next);
+  };
+
+  const bindDaySwipe = useCallback((node: HTMLDivElement | null) => {
+    daySwipeCleanup.current?.();
+    daySwipeCleanup.current = null;
+    if (!node) return;
+    const track = node.querySelector<HTMLElement>("[data-day-track]");
+    if (!track) return;
+
+    let startX = 0;
+    let startY = 0;
+    let lastX = 0;
+    let axis: "h" | "v" | null = null;
+    let active = false;
+    let pointerId: number | null = null;
+    let busySlide = false;
+    let slideTimer = 0;
+    // Pixel + rAF: globals reduced-motion forces transition-duration: 0.01ms !important,
+    // so CSS transitions cannot settle slowly. Drive the ease in JS instead.
+    const panelWidth = () => Math.max(node.clientWidth, 1);
+    const baseX = () => -panelWidth();
+    const paintX = (x: number) => {
+      track.style.transition = "none";
+      track.style.transform = `translate3d(${x}px, 0, 0)`;
+    };
+    const slideMs = 420;
+    let slideRaf = 0;
+
+    const animateTo = (x: number) => {
+      window.clearTimeout(slideTimer);
+      if (slideRaf) cancelAnimationFrame(slideRaf);
+      const start = new DOMMatrix(getComputedStyle(track).transform).m41 || baseX();
+      const delta = x - start;
+      if (Math.abs(delta) < 0.5) {
+        paintX(x);
+        return Promise.resolve();
+      }
+      const startedAt = performance.now();
+      const ease = (t: number) => 1 - ((1 - t) ** 3);
+      return new Promise<void>((resolve) => {
+        let done = false;
+        const complete = () => {
+          if (done) return;
+          done = true;
+          window.clearTimeout(slideTimer);
+          if (slideRaf) cancelAnimationFrame(slideRaf);
+          slideRaf = 0;
+          paintX(x);
+          resolve();
+        };
+        const tick = (now: number) => {
+          const t = Math.min(1, (now - startedAt) / slideMs);
+          paintX(start + delta * ease(t));
+          if (t < 1) {
+            slideRaf = requestAnimationFrame(tick);
+            return;
+          }
+          complete();
+        };
+        slideRaf = requestAnimationFrame(tick);
+        slideTimer = window.setTimeout(complete, slideMs + 120);
+      });
+    };
+
+    const resetGesture = () => { active = false; axis = null; pointerId = null; };
+
+    const finish = (dx: number, usedAxis: "h" | "v" | null) => {
+      if (busySlide) return;
+      busySlide = true;
+      const width = panelWidth();
+      const origin = baseX();
+      if (usedAxis !== "h" || Math.abs(dx) < Math.min(40, width * 0.12)) {
+        void (async () => {
+          await animateTo(origin);
+          busySlide = false;
+        })();
+        return;
+      }
+      const outbound = dx < 0 ? origin - width : origin + width;
+      const direction: -1 | 1 = dx < 0 ? 1 : -1;
+      void (async () => {
+        const pending = browseHomeDayRef.current(direction, false);
+        await animateTo(outbound);
+        const allowed = await pending;
+        if (allowed) {
+          // Commit date and reset track in the same paint to avoid flashing the previous card.
+          flushSync(() => { commitHomeDayRef.current(direction); });
+          paintX(origin);
+        } else {
+          await animateTo(origin);
+        }
+        busySlide = false;
+      })();
+    };
+
+    const onPointerDown = (event: PointerEvent) => {
+      if (busySlide) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      active = true;
+      axis = null;
+      pointerId = event.pointerId;
+      startX = event.clientX;
+      lastX = event.clientX;
+      startY = event.clientY;
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      if (!active || pointerId !== event.pointerId) return;
+      lastX = event.clientX;
+      const dx = event.clientX - startX;
+      const dy = event.clientY - startY;
+      if (axis === null) {
+        if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+        axis = Math.abs(dx) >= Math.abs(dy) ? "h" : "v";
+        if (axis === "h") {
+          try { node.setPointerCapture(event.pointerId); } catch { /* ignore */ }
+        }
+      }
+      if (axis === "h") {
+        event.preventDefault();
+        track.style.transition = "none";
+        paintX(baseX() + dx);
+      }
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      if (pointerId !== event.pointerId) return;
+      const dx = (event.clientX || lastX) - startX;
+      const usedAxis = axis;
+      const captured = pointerId;
+      // Finish before releaseCapture so cancel cannot reverse the settle animation.
+      finish(dx, usedAxis);
+      resetGesture();
+      if (captured != null && node.hasPointerCapture(captured)) {
+        try { node.releasePointerCapture(captured); } catch { /* ignore */ }
+      }
+    };
+    const onCancel = () => {
+      if (busySlide) {
+        resetGesture();
+        return;
+      }
+      resetGesture();
+      busySlide = true;
+      void (async () => {
+        await animateTo(baseX());
+        busySlide = false;
+      })();
+    };
+
+    track.style.transition = "none";
+    paintX(baseX());
+    node.addEventListener("pointerdown", onPointerDown);
+    node.addEventListener("pointermove", onPointerMove);
+    node.addEventListener("pointerup", onPointerUp);
+    node.addEventListener("pointercancel", onCancel);
+    daySwipeCleanup.current = () => {
+      window.clearTimeout(slideTimer);
+      if (slideRaf) cancelAnimationFrame(slideRaf);
+      node.removeEventListener("pointerdown", onPointerDown);
+      node.removeEventListener("pointermove", onPointerMove);
+      node.removeEventListener("pointerup", onPointerUp);
+      node.removeEventListener("pointercancel", onCancel);
+      track.style.transition = "none";
+      paintX(baseX());
+    };
+  }, []);
+
+  useEffect(() => () => { daySwipeCleanup.current?.(); daySwipeCleanup.current = null; }, []);
+
   useEffect(() => {
-    if (tab !== "summary" || !dashboard?.profile.id || historyLoaded.current) return;
+    if ((tab !== "summary" && tab !== "home") || !dashboard?.profile.id || historyLoaded.current) return;
     let cancelled = false;
     const generation = sessionGeneration.current;
     void api<Dashboard>("/me").then((data) => {
       if (cancelled || generation !== sessionGeneration.current) return;
       historyLoaded.current = true;
       setDashboard((previous) => {
-        if (!previous) return data;
-        const date = new Intl.DateTimeFormat("en-GB", { timeZone: previous.profile.time_zone }).format(new Date());
-        return { ...previous,
-          calendar: [...data.calendar.filter((row) => row.local_date !== date), ...previous.calendar.filter((row) => row.local_date === date)],
-          events: [...data.events.filter((row) => row.local_date !== date), ...previous.events.filter((row) => row.local_date === date)],
-          jobs: [...data.jobs.filter((row) => row.local_date !== date), ...previous.jobs.filter((row) => row.local_date === date)] };
+        const merged = mergeHistoryPreservingToday(data, previous);
+        dashboardRef.current = merged;
+        return merged;
       });
     }).catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause.message : "No se pudo cargar el histórico."); });
     return () => { cancelled = true; };
-  }, [tab, dashboard?.profile.id]);
+  }, [tab, dashboard?.profile.id, mergeHistoryPreservingToday]);
+
+  useEffect(() => {
+    if (tab !== "home") setViewDate(null);
+  }, [tab]);
 
   useEffect(() => {
     void refreshToday(true).then(() => { if (new URLSearchParams(window.location.search).get("view") === "notifications") setTab("notifications"); });
@@ -217,6 +449,7 @@ export default function Home() {
 
   async function signOut() {
     historyLoaded.current = false;
+    setViewDate(null);
     sessionGeneration.current++; todayRequest.current = null; lastTimenetSyncAt.current = 0;
     todayFreshRef.current = false; setRefreshingToday(false); setTodayFresh(false);
     await removeDevicePush().catch(() => { /* Logout still clears the session if the device is offline. */ });
@@ -291,9 +524,12 @@ export default function Home() {
   const tabs: Array<[Tab, LucideIcon, string]> = [["home", House, "Inicio"], ["summary", CalendarClock, "Fichajes"], ["notifications", Bell, "Avisos"], ["settings", Settings, "Ajustes"]];
   if (dashboard.profile.role === "admin") tabs.push(["monitor", Activity, "Monitor"]);
   const today = new Intl.DateTimeFormat("en-GB", { timeZone: dashboard.profile.time_zone, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date());
+  const homeDate = viewDate ?? today;
+  const homePrevDate = shiftLocalDate(homeDate, -1);
+  const homeNextDate = shiftLocalDate(homeDate, 1);
+  const viewingToday = homeDate === today;
   const entryRecorded = dashboard.events.some((event) => event.local_date === today && event.action === "entry");
   const exitRecorded = dashboard.events.some((event) => event.local_date === today && event.action === "exit");
-
   return <main className="app-viewport text-zinc-950"><div className="app-shell">
     <header className="app-header">
       <div className="header-brand flex min-w-0 items-center gap-2"><Image src="/icon-192.png" alt="" width={40} height={40} className="h-10 w-10 shrink-0 rounded-xl" /><div className="min-w-0"><p className="truncate text-xs font-medium text-zinc-600">{dashboard.profile.display_name}</p><h1 className="whitespace-nowrap text-xl font-bold tracking-tight">Mi jornada<span className="text-emerald-600">.</span></h1></div></div>
@@ -306,18 +542,37 @@ export default function Home() {
     {error && <p role="alert" className="mx-4 mt-2 shrink-0 rounded-2xl bg-red-50 p-3 text-sm text-red-800">{error}</p>}{message && <p role="status" className="mx-4 mt-2 shrink-0 rounded-2xl bg-emerald-50 p-3 text-sm text-emerald-800">{message}</p>}
 
     <div className={`app-content min-h-0 flex-1 px-4 ${tab === "summary" || tab === "home" ? "flex flex-col overflow-hidden" : "overflow-y-auto overscroll-contain"}`}>
-    {tab === "home" && <section className="flex min-h-0 flex-1 flex-col gap-3 pt-4 pb-3">
-      {refreshingToday && <p role="status" className="flex shrink-0 items-center justify-center gap-2 text-sm text-zinc-600"><Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />Actualizando desde Timenet…</p>}
-      {!refreshingToday && !todayFresh && <p role="status" className="shrink-0 text-sm text-zinc-600">Estado sin actualizar · sincroniza para continuar</p>}
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain rounded-xl">
-        <DailyPunches calendar={dashboard.calendar ?? []} events={dashboard.events} jobs={dashboard.jobs} timeZone={dashboard.profile.time_zone} enabled={Boolean(dashboard.profile.enabled)} todayOnly />
-      </div>
-      <div className="shrink-0 space-y-2">
-        <div className="grid grid-cols-2 gap-3">
-          <button type="button" aria-label={punching === "entry" ? "Fichando…" : refreshingToday ? "Actualizando…" : entryRecorded ? "Entrada registrada" : "Fichar entrada"} aria-busy={punching === "entry" || refreshingToday || undefined} disabled={busy || refreshingToday || !todayFresh || needsReview || entryRecorded} onClick={() => void manualPunch("entry")} className="punch-action flex min-h-24 touch-manipulation flex-col items-center justify-center gap-2 rounded-3xl bg-emerald-800 p-4 text-white shadow-sm transition-colors active:bg-emerald-900 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-emerald-300"><span aria-hidden="true">{punching === "entry" || (refreshingToday && !entryRecorded) ? <Loader2 className="h-7 w-7 animate-spin" /> : entryRecorded ? <CheckCircle2 className="h-7 w-7" /> : !todayFresh || needsReview || busy ? <ShieldAlert className="h-7 w-7" /> : <ArrowDownLeft className="h-7 w-7" />}</span><span className="text-base font-semibold">{punching === "entry" ? "Fichando…" : refreshingToday && !entryRecorded ? "Actualizando…" : entryRecorded ? "Entrada registrada" : "Fichar entrada"}</span><span className="text-xs font-medium">{entryRecorded ? "Completado" : punching === "entry" || refreshingToday ? "Espera" : !todayFresh || needsReview || busy ? "No disponible" : "Disponible"}</span></button>
-          <button type="button" aria-label={punching === "exit" ? "Fichando…" : refreshingToday ? "Actualizando…" : exitRecorded ? "Salida registrada" : "Fichar salida"} aria-busy={punching === "exit" || refreshingToday || undefined} disabled={busy || refreshingToday || !todayFresh || needsReview || exitRecorded} onClick={() => void manualPunch("exit")} className="punch-action flex min-h-24 touch-manipulation flex-col items-center justify-center gap-2 rounded-3xl bg-rose-700 p-4 text-white shadow-sm transition-colors active:bg-rose-800 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-rose-300"><span aria-hidden="true">{punching === "exit" || (refreshingToday && !exitRecorded) ? <Loader2 className="h-7 w-7 animate-spin" /> : exitRecorded ? <CheckCircle2 className="h-7 w-7" /> : !todayFresh || needsReview || busy ? <ShieldAlert className="h-7 w-7" /> : <ArrowUpRight className="h-7 w-7" />}</span><span className="text-base font-semibold">{punching === "exit" ? "Fichando…" : refreshingToday && !exitRecorded ? "Actualizando…" : exitRecorded ? "Salida registrada" : "Fichar salida"}</span><span className="text-xs font-medium">{exitRecorded ? "Completado" : punching === "exit" || refreshingToday ? "Espera" : !todayFresh || needsReview || busy ? "No disponible" : "Disponible"}</span></button>
+    {tab === "home" && <section className="relative flex min-h-0 flex-1 flex-col gap-3 pt-4 pb-3">
+      {refreshingToday && <p role="status" className="pointer-events-none absolute inset-x-0 top-1 z-10 mx-auto flex w-fit items-center justify-center gap-2 rounded-full bg-zinc-50/95 px-3 py-1 text-sm text-zinc-600 shadow-sm ring-1 ring-zinc-200/80 backdrop-blur-sm"><Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />Actualizando desde Timenet…</p>}
+      {!refreshingToday && !todayFresh && <p role="status" className="pointer-events-none absolute inset-x-0 top-1 z-10 mx-auto w-fit rounded-full bg-amber-50/95 px-3 py-1 text-sm text-zinc-600 shadow-sm ring-1 ring-amber-200/80 backdrop-blur-sm">Estado sin actualizar · sincroniza para continuar</p>}
+      <div
+        ref={bindDaySwipe}
+        className="day-swipe min-h-0 flex-1 overflow-hidden overscroll-contain rounded-xl"
+        aria-label={`Jornada del ${homeDate}. Desliza horizontalmente para cambiar de día.`}
+      >
+        <div data-day-track className="day-swipe-track flex h-full w-[300%] touch-pan-y will-change-transform">
+          <div className="day-swipe-panel box-border h-full w-1/3 shrink-0 overflow-x-hidden overflow-y-auto overscroll-contain px-0.5">
+            <DailyPunches calendar={dashboard.calendar ?? []} events={dashboard.events} jobs={dashboard.jobs} timeZone={dashboard.profile.time_zone} enabled={Boolean(dashboard.profile.enabled)} todayOnly selectedDate={homePrevDate} />
+          </div>
+          <div className="day-swipe-panel box-border h-full w-1/3 shrink-0 overflow-x-hidden overflow-y-auto overscroll-contain px-0.5">
+            <DailyPunches calendar={dashboard.calendar ?? []} events={dashboard.events} jobs={dashboard.jobs} timeZone={dashboard.profile.time_zone} enabled={Boolean(dashboard.profile.enabled)} todayOnly selectedDate={homeDate} />
+          </div>
+          <div className="day-swipe-panel box-border h-full w-1/3 shrink-0 overflow-x-hidden overflow-y-auto overscroll-contain px-0.5">
+            <DailyPunches calendar={dashboard.calendar ?? []} events={dashboard.events} jobs={dashboard.jobs} timeZone={dashboard.profile.time_zone} enabled={Boolean(dashboard.profile.enabled)} todayOnly selectedDate={homeNextDate} />
+          </div>
         </div>
-        <p className="text-center text-xs text-zinc-600">{needsReview ? "Sincroniza para revisar el último fichaje antes de continuar." : refreshingToday ? "Consultando Timenet…" : "Fichaje manual en Timenet · se registra al pulsar"}</p>
+      </div>
+      <div className="home-day-actions shrink-0">
+        {viewingToday ? <>
+        <div className="grid grid-cols-2 gap-3">
+          <button type="button" aria-label={punching === "entry" ? "Fichando…" : refreshingToday ? "Actualizando…" : entryRecorded ? "Entrada registrada" : "Fichar entrada"} aria-busy={punching === "entry" || refreshingToday || undefined} disabled={busy || refreshingToday || !todayFresh || needsReview || entryRecorded} onClick={() => void manualPunch("entry")} className="punch-action flex h-24 touch-manipulation flex-col items-center justify-center gap-1 rounded-3xl bg-emerald-800 px-3 py-3 text-white shadow-sm transition-colors active:bg-emerald-900 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-emerald-300"><span aria-hidden="true" className="grid h-7 w-7 place-items-center">{punching === "entry" || (refreshingToday && !entryRecorded) ? <Loader2 className="h-7 w-7 animate-spin" /> : entryRecorded ? <CheckCircle2 className="h-7 w-7" /> : !todayFresh || needsReview || busy ? <ShieldAlert className="h-7 w-7" /> : <ArrowDownLeft className="h-7 w-7" />}</span><span className="text-base font-semibold leading-tight">{punching === "entry" ? "Fichando…" : refreshingToday && !entryRecorded ? "Actualizando…" : entryRecorded ? "Entrada registrada" : "Fichar entrada"}</span><span className="text-xs font-medium leading-none">{entryRecorded ? "Completado" : punching === "entry" || refreshingToday ? "Espera" : !todayFresh || needsReview || busy ? "No disponible" : "Disponible"}</span></button>
+          <button type="button" aria-label={punching === "exit" ? "Fichando…" : refreshingToday ? "Actualizando…" : exitRecorded ? "Salida registrada" : "Fichar salida"} aria-busy={punching === "exit" || refreshingToday || undefined} disabled={busy || refreshingToday || !todayFresh || needsReview || exitRecorded} onClick={() => void manualPunch("exit")} className="punch-action flex h-24 touch-manipulation flex-col items-center justify-center gap-1 rounded-3xl bg-rose-700 px-3 py-3 text-white shadow-sm transition-colors active:bg-rose-800 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-rose-300"><span aria-hidden="true" className="grid h-7 w-7 place-items-center">{punching === "exit" || (refreshingToday && !exitRecorded) ? <Loader2 className="h-7 w-7 animate-spin" /> : exitRecorded ? <CheckCircle2 className="h-7 w-7" /> : !todayFresh || needsReview || busy ? <ShieldAlert className="h-7 w-7" /> : <ArrowUpRight className="h-7 w-7" />}</span><span className="text-base font-semibold leading-tight">{punching === "exit" ? "Fichando…" : refreshingToday && !exitRecorded ? "Actualizando…" : exitRecorded ? "Salida registrada" : "Fichar salida"}</span><span className="text-xs font-medium leading-none">{exitRecorded ? "Completado" : punching === "exit" || refreshingToday ? "Espera" : !todayFresh || needsReview || busy ? "No disponible" : "Disponible"}</span></button>
+        </div>
+        <p className="mt-2 text-center text-xs text-zinc-600">{needsReview ? "Sincroniza para revisar el último fichaje antes de continuar." : refreshingToday ? "Consultando Timenet…" : "Fichaje manual en Timenet · se registra al pulsar"}</p>
+        </> : <div className="home-day-actions-alt flex h-full flex-col items-center justify-center rounded-2xl border border-zinc-200 bg-white px-4 text-center">
+          <p className="text-sm text-zinc-600">Consultando otro día. El fichaje manual solo está disponible hoy.</p>
+          <Button className="mt-3" variant="secondary" onClick={() => setViewDate(null)}>Volver a hoy</Button>
+        </div>}
       </div>
     </section>}
     {tab === "summary" && <section className="flex min-h-0 flex-1 flex-col gap-3 pt-3">
