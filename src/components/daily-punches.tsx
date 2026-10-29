@@ -125,7 +125,7 @@ function DayCard({
 export function DailyPunches({ calendar, events, jobs, timeZone, enabled, todayOnly = false, selectedDate }: { calendar: CalendarDay[]; events: Event[]; jobs: Job[]; timeZone: string; enabled: boolean; todayOnly?: boolean; selectedDate?: string }) {
   const [selectedMonth, setSelectedMonth] = useState("");
   const [expandedDays, setExpandedDays] = useState<Record<string, boolean>>({});
-  const todayRef = useRef<HTMLElement>(null);
+  const todayRef = useRef<HTMLDivElement>(null);
   const today = new Intl.DateTimeFormat("en-GB", { timeZone, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date());
   const focusDate = todayOnly ? (selectedDate ?? today) : today;
   const dates = [...new Set([...(todayOnly ? [focusDate] : []),...calendar.map((day) => day.local_date), ...events.map((event) => event.local_date), ...jobs.map((job) => job.local_date)])].sort((a, b) => dateKey(a).localeCompare(dateKey(b)));
