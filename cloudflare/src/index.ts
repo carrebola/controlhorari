@@ -5,6 +5,7 @@ import { flushPush, pushConfig, testPush, validSubscription } from "./push";
 import { guardedTimenetPunch, readTimenetHistory, TimenetError, type PunchResult } from "./timenet";
 import { configuredPunchPlan, localDate, weekdayForLocalDate } from "./time";
 import type { CalendarDayRow, Env, ScheduleRow, SessionUser, UserRow } from "./types";
+import { claimUncertainJob } from "./uncertain-sync";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -124,6 +125,10 @@ async function syncHistory(env: Env, user: SessionUser, todayOnly = false) {
   const automatic = await env.DB.prepare(
     `SELECT id, job_id, local_date, action, recorded_time FROM punch_events WHERE user_id = ? AND source = 'automatic'${todayOnly ? " AND local_date = ?" : ""}`,
   ).bind(...(todayOnly ? [user.id, today] : [user.id])).all<{ id: string; job_id: string | null; local_date: string; action: string; recorded_time: string }>();
+  const uncertainJobs = await env.DB.prepare(
+    `SELECT id, local_date, action FROM jobs WHERE user_id = ? AND status = 'uncertain'${todayOnly ? " AND local_date = ?" : ""}`,
+  ).bind(...(todayOnly ? [user.id, today] : [user.id])).all<{ id: string; local_date: string; action: string }>();
+  const claimedUncertain = new Set<string>();
   const minute = (value: string) => value.slice(0, 5);
   const now = Date.now();
   const statements: D1PreparedStatement[] = [];
@@ -173,11 +178,31 @@ async function syncHistory(env: Env, user: SessionUser, todayOnly = false) {
       candidate.local_date === event.localDate && candidate.action === event.action && minute(candidate.recorded_time) === minute(event.time));
     if (matched) {
       statements.push(env.DB.prepare("UPDATE punch_events SET recorded_time = ? WHERE id = ?").bind(event.time, matched.id));
-    } else {
-      statements.push(env.DB.prepare(
-        "INSERT OR IGNORE INTO punch_events (id, user_id, job_id, local_date, action, source, recorded_time, created_at) VALUES (?, ?, NULL, ?, ?, 'manual', ?, ?)",
-      ).bind(`timenet:${user.id}:${event.remoteId}`, user.id, event.localDate, event.action, event.time, now));
+      continue;
     }
+    const uncertain = claimUncertainJob(uncertainJobs.results, event.localDate, event.action, claimedUncertain);
+    if (uncertain) {
+      statements.push(env.DB.prepare(
+        `UPDATE jobs SET status = 'success', timenet_time = ?, error_code = 'confirmed_by_sync', error_message = NULL, updated_at = ? WHERE id = ? AND user_id = ? AND status = 'uncertain'`,
+      ).bind(event.time, now, uncertain.id, user.id));
+      statements.push(env.DB.prepare(
+        "INSERT INTO punch_events (id, user_id, job_id, local_date, action, source, recorded_time, created_at) VALUES (?, ?, ?, ?, ?, 'automatic', ?, ?)",
+      ).bind(crypto.randomUUID(), user.id, uncertain.id, event.localDate, event.action, event.time, now));
+      statements.push(env.DB.prepare(
+        "INSERT INTO notifications (id, user_id, level, title, message, job_id, created_at) VALUES (?, ?, 'success', ?, ?, ?, ?)",
+      ).bind(
+        crypto.randomUUID(),
+        user.id,
+        "Fichaje confirmado al sincronizar",
+        `Timenet tenía el fichaje a las ${event.time}; se ha guardado como automático.`,
+        uncertain.id,
+        now,
+      ));
+      continue;
+    }
+    statements.push(env.DB.prepare(
+      "INSERT OR IGNORE INTO punch_events (id, user_id, job_id, local_date, action, source, recorded_time, created_at) VALUES (?, ?, NULL, ?, ?, 'manual', ?, ?)",
+    ).bind(`timenet:${user.id}:${event.remoteId}`, user.id, event.localDate, event.action, event.time, now));
   }
   // Keep replacement atomic: failed imports must preserve the previous history.
   await env.DB.batch(statements);
@@ -306,13 +331,34 @@ async function updateConfig(request: Request, env: Env, user: SessionUser) {
   if (planChanged) {
     const timeZone = oldUser?.time_zone ?? env.TIME_ZONE;
     const todayKey = localDate(now, timeZone).split("/").reverse().join("-");
-    const calendar = await env.DB.prepare("SELECT * FROM calendar_days WHERE user_id = ? AND substr(local_date,7,4) || '-' || substr(local_date,4,2) || '-' || substr(local_date,1,2) >= ?")
-      .bind(user.id, todayKey).all<CalendarDayRow>();
+    const [calendar, lockedDays] = await Promise.all([
+      env.DB.prepare("SELECT * FROM calendar_days WHERE user_id = ? AND substr(local_date,7,4) || '-' || substr(local_date,4,2) || '-' || substr(local_date,1,2) >= ?")
+        .bind(user.id, todayKey).all<CalendarDayRow>(),
+      // Keep randoms for days already punched or with an attempted automatic job.
+      env.DB.prepare(
+        `SELECT local_date AS d FROM punch_events WHERE user_id = ?
+         UNION
+         SELECT local_date AS d FROM jobs WHERE user_id = ? AND (attempt_count > 0 OR status NOT IN ('scheduled', 'skipped'))`,
+      ).bind(user.id, user.id).all<{ d: string }>(),
+    ]);
+    const lockedDates = new Set(lockedDays.results.map((row) => row.d));
     for (const day of calendar.results) {
+      if (lockedDates.has(day.local_date)) {
+        statements.push(env.DB.prepare("UPDATE calendar_days SET margin_seconds = ? WHERE user_id = ? AND local_date = ?")
+          .bind(margin, user.id, day.local_date));
+        continue;
+      }
       const [d, m, y] = day.local_date.split("/").map(Number);
       const parts = { day: d, month: m, year: y };
       const schedule = schedules[weekdayForLocalDate(parts)];
-      const plan = configuredPunchPlan(parts, timeZone, { enabled: schedule.enabled ? 1 : 0, entry_time: schedule.entry, exit_time: schedule.exit }, margin, day);
+      // Force a fresh random plan: do not reuse the saved monthly times for unpunched days.
+      const plan = configuredPunchPlan(parts, timeZone, { enabled: schedule.enabled ? 1 : 0, entry_time: schedule.entry, exit_time: schedule.exit }, margin, {
+        entry_time: day.entry_time,
+        exit_time: day.exit_time,
+        plan_key: null,
+        random_entry_at: null,
+        random_exit_at: null,
+      });
       statements.push(env.DB.prepare("UPDATE calendar_days SET random_entry_at = ?, random_exit_at = ?, margin_seconds = ?, plan_key = ? WHERE user_id = ? AND local_date = ?")
         .bind(plan?.entryAt ?? null, plan?.exitAt ?? null, margin, plan?.key ?? null, user.id, day.local_date));
     }

@@ -14,6 +14,15 @@ export interface TimenetHistoryEvent {
   time: string;
 }
 
+/** True source of truth after a click when the home UI state is slow or unclear. */
+export function historyConfirmsPunch(
+  events: TimenetHistoryEvent[],
+  localDate: string,
+  action: JobAction,
+): TimenetHistoryEvent | undefined {
+  return events.find((event) => event.localDate === localDate && event.action === action);
+}
+
 const datePattern = /^\d{2}\/\d{2}\/\d{4}$/;
 const timePattern = /^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
 

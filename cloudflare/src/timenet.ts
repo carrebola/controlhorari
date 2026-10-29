@@ -1,7 +1,7 @@
 import puppeteer, { type ElementHandle, type Page } from "@cloudflare/puppeteer";
 import type { Env, JobAction } from "./types";
 import { localClock, localDate as currentLocalDate } from "./time";
-import { parseTimenetHistory, type TimenetHistoryEvent } from "./timenet-history";
+import { historyConfirmsPunch, parseTimenetHistory, type TimenetHistoryEvent } from "./timenet-history";
 import { observePunchOutcome } from "./timenet-confirmation";
 import { guardedPunch } from "./punch-guard";
 
@@ -142,10 +142,37 @@ async function punchOnPage(
     }
     clicked = true;
     await button.click();
+    await buttonHandle.dispose();
+    return await confirmPunchAfterClick(page, action, localDate, timeZone);
+  } catch (error) {
+    if (clicked) {
+      try {
+        return await confirmViaHistory(page, action, localDate);
+      } catch (historyError) {
+        console.error("No se pudo confirmar el fichaje en el historial de Timenet", historyError);
+      }
+    }
+    return {
+      ok: false,
+      uncertain: clicked,
+      code: clicked ? "confirmation_failed" : "automation_failed",
+      message: clicked
+        ? "Se pulsó el botón, pero no se pudo confirmar el resultado. Revisa Timenet antes de repetir."
+        : error instanceof Error ? error.message : "No se pudo completar el fichaje.",
+    };
+  }
+}
+
+async function confirmPunchAfterClick(
+  page: Page,
+  action: JobAction,
+  localDate: string,
+  timeZone: string,
+): Promise<PunchResult> {
+  try {
     const outcomeHandle = await page.waitForFunction(observePunchOutcome, { timeout: 15_000 }, action === "entry");
     const outcome = await outcomeHandle.jsonValue();
     await outcomeHandle.dispose();
-    await buttonHandle.dispose();
     if (outcome === "duplicate_confirmation") {
       return {
         ok: false,
@@ -159,16 +186,29 @@ async function punchOnPage(
       time: localClock(Date.now(), timeZone),
       message: `${action === "entry" ? "Entrada" : "Salida"} registrada correctamente.`,
     };
-  } catch (error) {
+  } catch (uiError) {
+    console.error("La UI de Timenet no confirmó el fichaje a tiempo; se comprueba el historial", uiError);
+    return confirmViaHistory(page, action, localDate);
+  }
+}
+
+async function confirmViaHistory(page: Page, action: JobAction, localDate: string): Promise<PunchResult> {
+  const history = await readHistoryOnPage(page);
+  const match = historyConfirmsPunch(history.events, localDate, action);
+  if (match) {
     return {
-      ok: false,
-      uncertain: clicked,
-      code: clicked ? "confirmation_failed" : "automation_failed",
-      message: clicked
-        ? "Se pulsó el botón, pero no se pudo confirmar el resultado. Revisa Timenet antes de repetir."
-        : error instanceof Error ? error.message : "No se pudo completar el fichaje.",
+      ok: true,
+      time: match.time,
+      code: "confirmed_by_history",
+      message: `${action === "entry" ? "Entrada" : "Salida"} confirmada en el historial de Timenet.`,
     };
   }
+  return {
+    ok: false,
+    uncertain: true,
+    code: "confirmation_failed",
+    message: "Se pulsó el botón, pero no se pudo confirmar el resultado. Revisa Timenet antes de repetir.",
+  };
 }
 
 async function withTimenetPage<T>(env: Env, pin: string, run: (page: Page, browser: Browser) => Promise<T>): Promise<T> {
