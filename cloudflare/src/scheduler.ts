@@ -194,7 +194,9 @@ export async function runScheduler(env: Env) {
     const ensured = await ensureTodayJobs(env, startedAt);
     await markMissedJobs(env, startedAt);
     const jobs = await claimDueJobs(env, Date.now());
-    const outcomes = await Promise.all(jobs.map((job) => processJob(env, job)));
+    // Browser Rendering is shared; overlapping Timenet sessions make confirmation flaky.
+    const outcomes = [];
+    for (const job of jobs) outcomes.push(await processJob(env, job));
     const successCount = outcomes.filter((outcome) => outcome.success).length;
     const failureCount = outcomes.length - successCount;
     const finishedAt = Date.now();

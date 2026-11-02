@@ -107,7 +107,13 @@ async function todayDashboard(env: Env, user: SessionUser) {
 async function syncHistory(env: Env, user: SessionUser, todayOnly = false) {
   const credentials = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(user.id).first<UserRow>();
   if (!credentials) return error("Usuario no encontrado.", 404);
-  const pin = await decryptSecret(credentials.pin_ciphertext, credentials.pin_iv, env.DATA_ENCRYPTION_KEY);
+  let pin: string;
+  try {
+    pin = await decryptSecret(credentials.pin_ciphertext, credentials.pin_iv, env.DATA_ENCRYPTION_KEY);
+  } catch (cause) {
+    console.error("No se pudo descifrar el PIN de Timenet", cause instanceof Error ? cause.message : "error");
+    return error("No se pudo leer el PIN de Timenet. Vuelve a guardarlo en Ajustes e inténtalo de nuevo.", 422);
+  }
   const snapshot = await readTimenetHistory(env, pin);
   const today = localDate(Date.now(), credentials.time_zone);
   if (todayOnly && !snapshot.days.some((day) => day.localDate === today)) throw new TimenetError("El historial de Timenet no incluye el día de hoy.", 502);
@@ -204,6 +210,48 @@ async function syncHistory(env: Env, user: SessionUser, todayOnly = false) {
       "INSERT OR IGNORE INTO punch_events (id, user_id, job_id, local_date, action, source, recorded_time, created_at) VALUES (?, ?, NULL, ?, ?, 'manual', ?, ?)",
     ).bind(`timenet:${user.id}:${event.remoteId}`, user.id, event.localDate, event.action, event.time, now));
   }
+  // If Timenet has a complete day and still no mark, the click never landed: drop the
+  // uncertain lock so cron and the in-app button can retry instead of staying blocked.
+  const syncedDates = new Set(days.map((day) => day.localDate));
+  for (const job of uncertainJobs.results) {
+    if (claimedUncertain.has(job.id) || !syncedDates.has(job.local_date)) continue;
+    if (remoteEvents.some((event) => event.localDate === job.local_date && event.action === job.action)) continue;
+    statements.push(env.DB.prepare(
+      "DELETE FROM punch_guards WHERE user_id = ? AND local_date = ? AND action = ? AND status IN ('uncertain', 'pending')",
+    ).bind(user.id, job.local_date, job.action));
+    statements.push(env.DB.prepare(
+      `UPDATE jobs SET status = CASE WHEN reviewed_retry_used = 0 THEN 'scheduled' ELSE 'failed' END,
+       target_at = CASE WHEN reviewed_retry_used = 0 THEN ? ELSE target_at END,
+       reviewed_retry_used = CASE WHEN reviewed_retry_used = 0 THEN 1 ELSE reviewed_retry_used END,
+       error_code = CASE WHEN reviewed_retry_used = 0 THEN 'retry_authorized' ELSE 'not_in_timenet' END,
+       error_message = CASE WHEN reviewed_retry_used = 0 THEN NULL ELSE ? END,
+       updated_at = ? WHERE id = ? AND user_id = ? AND status = 'uncertain'`,
+    ).bind(
+      now + 30_000,
+      "Timenet no tiene este fichaje tras sincronizar. Se ha liberado el bloqueo para poder reintentar.",
+      now,
+      job.id,
+      user.id,
+    ));
+    statements.push(env.DB.prepare(
+      "INSERT INTO notifications (id, user_id, level, title, message, job_id, created_at) VALUES (?, ?, 'warning', ?, ?, ?, ?)",
+    ).bind(
+      crypto.randomUUID(),
+      user.id,
+      "Bloqueo de fichaje liberado",
+      "Timenet no tenía el fichaje pendiente. Se ha quitado el candado para poder fichar otra vez desde la app o el automático.",
+      job.id,
+      now,
+    ));
+  }
+  for (const day of days) {
+    for (const action of ["entry", "exit"] as const) {
+      if (remoteEvents.some((event) => event.localDate === day.localDate && event.action === action)) continue;
+      statements.push(env.DB.prepare(
+        "DELETE FROM punch_guards WHERE user_id = ? AND local_date = ? AND action = ? AND status = 'uncertain'",
+      ).bind(user.id, day.localDate, action));
+    }
+  }
   // Keep replacement atomic: failed imports must preserve the previous history.
   await env.DB.batch(statements);
   await env.DB.prepare("UPDATE manual_punch_requests SET status = 'reviewed', updated_at = ? WHERE user_id = ? AND (status = 'uncertain' OR (status = 'running' AND created_at < ?))")
@@ -260,6 +308,10 @@ async function resolveUncertainJob(request: Request, env: Env, user: SessionUser
   const resolution = stringField(body, "resolution");
   const now = Date.now();
 
+  const job = await env.DB.prepare("SELECT local_date, action, reviewed_retry_used FROM jobs WHERE id = ? AND user_id = ? AND status = 'uncertain'")
+    .bind(jobId, user.id).first<{ local_date: string; action: string; reviewed_retry_used: number }>();
+  if (!job) return error("Este fichaje ya se ha revisado o no existe.", 409);
+
   if (resolution === "confirmed") {
     const recordedTime = stringField(body, "recordedTime");
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(recordedTime)) return error("Indica una hora válida para el fichaje.");
@@ -269,6 +321,9 @@ async function resolveUncertainJob(request: Request, env: Env, user: SessionUser
     ).bind(recordedTime, now, now, jobId, user.id).run();
     if (!update.meta.changes) return error("Este fichaje ya se ha revisado o no existe.", 409);
     await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE punch_guards SET status = 'confirmed' WHERE user_id = ? AND local_date = ? AND action = ? AND status IN ('uncertain', 'pending')",
+      ).bind(user.id, job.local_date, job.action),
       env.DB.prepare(
         `INSERT OR IGNORE INTO punch_events (id, user_id, job_id, local_date, action, source, recorded_time, created_at)
          SELECT ?, user_id, id, local_date, action, 'automatic', ?, ? FROM jobs WHERE id = ? AND user_id = ? AND status = 'success' AND error_code = 'confirmed_by_user'`,
@@ -281,14 +336,21 @@ async function resolveUncertainJob(request: Request, env: Env, user: SessionUser
   }
 
   if (resolution === "retry") {
+    if (job.reviewed_retry_used) return error("Este fichaje ya se ha revisado o no admite otro intento.", 409);
     const update = await env.DB.prepare(
       `UPDATE jobs SET status = 'scheduled', target_at = ?, reviewed_retry_used = 1, error_code = 'retry_authorized',
        error_message = NULL, updated_at = ? WHERE id = ? AND user_id = ? AND status = 'uncertain' AND reviewed_retry_used = 0`,
     ).bind(now, now, jobId, user.id).run();
     if (!update.meta.changes) return error("Este fichaje ya se ha revisado o no admite otro intento.", 409);
-    await env.DB.prepare(
-      "INSERT INTO notifications (id, user_id, level, title, message, job_id, created_at) VALUES (?, ?, 'warning', ?, ?, ?, ?)",
-    ).bind(crypto.randomUUID(), user.id, "Reintento autorizado", "Has confirmado que el fichaje no se registró. Se realizará un último intento.", jobId, now).run();
+    // Without clearing the guard, cron and the in-app button stay punch_locked forever.
+    await env.DB.batch([
+      env.DB.prepare(
+        "DELETE FROM punch_guards WHERE user_id = ? AND local_date = ? AND action = ? AND status IN ('uncertain', 'pending')",
+      ).bind(user.id, job.local_date, job.action),
+      env.DB.prepare(
+        "INSERT INTO notifications (id, user_id, level, title, message, job_id, created_at) VALUES (?, ?, 'warning', ?, ?, ?, ?)",
+      ).bind(crypto.randomUUID(), user.id, "Reintento autorizado", "Has confirmado que el fichaje no se registró. Se realizará un último intento.", jobId, now),
+    ]);
     return json({ ok: true, message: "Reintento autorizado. El servidor volverá a intentar el fichaje." });
   }
 
