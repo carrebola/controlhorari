@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import { AppUpdateBanner } from "@/components/app-update";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -14,7 +15,10 @@ export const viewport: Viewport = { width: "device-width", initialScale: 1, view
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html lang="es" className="h-full antialiased">
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        <AppUpdateBanner />
+        {children}
+      </body>
     </html>
   );
 }
