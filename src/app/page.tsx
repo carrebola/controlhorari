@@ -3,7 +3,7 @@
 import Image from "next/image";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { Activity, ArrowDownLeft, ArrowUpRight, Bell, CalendarClock, CheckCircle2, Clock3, House, Loader2, LogOut, RefreshCcw, Save, Settings, ShieldAlert, XCircle } from "lucide-react";
+import { Activity, Archive, ArrowDownLeft, ArrowUpRight, Bell, CalendarClock, CheckCircle2, Clock3, House, Loader2, LogOut, RefreshCcw, Save, Settings, ShieldAlert, Users, XCircle } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,7 +14,7 @@ import { MobileSetup, removeDevicePush } from "@/components/mobile-setup";
 import { dateKey, shiftLocalDate } from "@/lib/local-date";
 
 type Role = "user" | "admin";
-type Tab = "home" | "summary" | "notifications" | "settings" | "monitor";
+type Tab = "home" | "summary" | "notifications" | "settings" | "users" | "monitor";
 type JobStatus = "scheduled" | "claimed" | "running" | "success" | "failed" | "uncertain" | "skipped" | "missed";
 type Profile = { id: string; username: string; display_name: string; role: Role; enabled: number; margin_seconds: number; time_zone: string };
 type Schedule = { weekday: number; enabled: number; entry_time: string; exit_time: string };
@@ -24,7 +24,9 @@ type CalendarDay = { local_date: string; label: string; entry_time: string | nul
 type Notice = { id: string; level: "success" | "warning" | "error" | "info"; title: string; message: string; created_at: number; read_at: number | null };
 type SchedulerRun = { id: string; started_at: number; finished_at: number | null; status: string; users_scanned: number; jobs_processed: number; success_count: number; failure_count: number; duration_ms: number | null };
 type Dashboard = { ok: true; profile: Profile; schedules: Schedule[]; jobs: Job[]; events: PunchEvent[]; calendar: CalendarDay[]; notifications: Notice[]; health: { latestRun: SchedulerRun | null; schedulerHealthy: boolean; last24Hours: { success_count: number | null; failure_count: number | null; average_delay_ms: number | null } | null } };
-type AdminHealth = { ok: true; latestRuns: SchedulerRun[]; statusCounts: { status: string; count: number }[]; users: { total: number; enabled: number }; recentFailures: Array<Job & { username: string; display_name: string }> };
+type PunchOrigin = "automatic" | "app" | "timenet" | "manual";
+type RecentJob = { id: string; local_date: string; action: "entry" | "exit"; status: JobStatus; error_message: string | null; target_at: number | null; executed_at: number | null; updated_at: number; recorded_time: string | null; username: string; display_name: string; origin: PunchOrigin };
+type AdminHealth = { ok: true; latestRuns: SchedulerRun[]; statusCounts: { status: string; count: number }[]; users: { total: number; enabled: number }; recentJobs: RecentJob[] };
 type AdminUser = { id: string; username: string; display_name: string; role: Role; enabled: number; created_at: number };
 
 class ApiError extends Error {
@@ -33,6 +35,7 @@ class ApiError extends Error {
 
 const dayNames = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"];
 const statusLabels: Record<JobStatus, string> = { scheduled: "Programado", claimed: "Preparando", running: "Ejecutando", success: "Correcto", failed: "Fallido", uncertain: "Revisar", skipped: "Omitido", missed: "No ejecutado" };
+const originLabels: Record<PunchOrigin, string> = { automatic: "Automático", app: "Manual app", timenet: "Manual Timenet", manual: "Manual" };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api/backend${path}`, { ...init, headers: { "content-type": "application/json", ...(init?.headers || {}) }, cache: "no-store" });
@@ -43,7 +46,37 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 function timeLabel(value: number | null | undefined) {
   if (!value) return "—";
-  return new Intl.DateTimeFormat("es-ES", { dateStyle: "short", timeStyle: "medium", timeZone: "Europe/Madrid" }).format(new Date(value));
+  const label = new Intl.DateTimeFormat("es-ES", {
+    weekday: "long",
+    day: "numeric",
+    month: "numeric",
+    year: "2-digit",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: "Europe/Madrid",
+  }).format(new Date(value));
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function punchStamp(job: RecentJob) {
+  if (job.local_date && job.recorded_time) {
+    const [day, month, year] = job.local_date.split("/").map(Number);
+    const [hour, minute, second = 0] = job.recorded_time.split(":").map(Number);
+    if (day && month && year) return Date.UTC(year, month - 1, day, hour || 0, minute || 0, second || 0);
+  }
+  return job.executed_at || job.target_at || job.updated_at || 0;
+}
+
+function punchTimeLabel(job: RecentJob) {
+  if (job.local_date && job.recorded_time) {
+    const [day, month, year] = job.local_date.split("/").map(Number);
+    const weekday = new Intl.DateTimeFormat("es-ES", { weekday: "long", timeZone: "UTC" }).format(new Date(Date.UTC(year, month - 1, day, 12)));
+    const clock = job.recorded_time.length === 5 ? `${job.recorded_time}:00` : job.recorded_time;
+    const label = `${weekday}, ${day}/${month}/${String(year).slice(-2)}, ${clock}`;
+    return label.charAt(0).toUpperCase() + label.slice(1);
+  }
+  return timeLabel(job.executed_at || job.target_at || job.updated_at);
 }
 
 function StatusBadge({ status }: { status: JobStatus }) {
@@ -51,13 +84,16 @@ function StatusBadge({ status }: { status: JobStatus }) {
   return <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${palette}`}>{statusLabels[status]}</span>;
 }
 
-function MetricCard({ label, value, detail }: { label: string; value: string; detail?: string }) {
-  return <div className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm"><p className="text-xs font-medium uppercase tracking-wide text-zinc-500">{label}</p><p className="mt-2 text-2xl font-semibold tabular-nums">{value}</p>{detail && <p className="mt-1 text-sm text-zinc-600">{detail}</p>}</div>;
+function MetricCard({ label, value, detail, className = "" }: { label: string; value: string; detail?: string; className?: string }) {
+  return <div className={`min-w-0 rounded-xl border border-zinc-200 bg-white p-3 shadow-sm sm:p-4 ${className}`}><p className="text-[11px] font-medium uppercase leading-tight tracking-wide text-zinc-500 sm:text-xs">{label}</p><p className="mt-2 truncate text-xl font-semibold tabular-nums sm:text-2xl">{value}</p>{detail && <p className="mt-1 break-words text-xs leading-snug text-zinc-600 sm:text-sm">{detail}</p>}</div>;
 }
 
 export default function Home() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [adminHealth, setAdminHealth] = useState<AdminHealth | null>(null);
+  const [onlyFailures, setOnlyFailures] = useState(false);
+  const [punchUserFilter, setPunchUserFilter] = useState("all");
+  const [exitingNoticeIds, setExitingNoticeIds] = useState<string[]>([]);
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -86,6 +122,7 @@ export default function Home() {
   const [enabled, setEnabled] = useState(false);
   const [margin, setMargin] = useState(60);
   const [newPin, setNewPin] = useState("");
+  const [newPassword, setNewPassword] = useState("");
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [userForm, setUserForm] = useState({ username: "", displayName: "", password: "", timenetPin: "", role: "user" as Role });
 
@@ -431,7 +468,7 @@ export default function Home() {
     return () => { document.removeEventListener("visibilitychange", resume); window.removeEventListener("pageshow", restored); window.removeEventListener("online", resume); };
   }, [dashboard?.profile.id, busy]);
   useEffect(() => {
-    if (tab !== "monitor" || dashboard?.profile.role !== "admin") return;
+    if ((tab !== "monitor" && tab !== "users") || dashboard?.profile.role !== "admin") return;
     void Promise.all([api<AdminHealth>("/admin/health"), api<{ ok: true; users: AdminUser[] }>("/admin/users")])
       .then(([health, users]) => { setAdminHealth(health); setAdminUsers(users.users); })
       .catch((cause) => setError(cause instanceof Error ? cause.message : "No se pudo cargar el monitor."));
@@ -461,8 +498,8 @@ export default function Home() {
     event.preventDefault(); setBusy(true); setError(""); setMessage("");
     try {
       if (schedules.length !== 7) throw new Error("El horario semanal aún no está cargado. Espera un momento y vuelve a guardar.");
-      await api("/me/config", { method: "PUT", body: JSON.stringify({ enabled, marginSeconds: margin, timenetPin: newPin || undefined, schedules: schedules.map((day) => ({ enabled: Boolean(day.enabled), entry: day.entry_time, exit: day.exit_time })) }) });
-      setNewPin(""); setMessage("Configuración guardada en el servidor."); await refresh();
+      await api("/me/config", { method: "PUT", body: JSON.stringify({ enabled, marginSeconds: margin, timenetPin: newPin || undefined, password: newPassword || undefined, schedules: schedules.map((day) => ({ enabled: Boolean(day.enabled), entry: day.entry_time, exit: day.exit_time })) }) });
+      setNewPin(""); setNewPassword(""); setMessage("Configuración guardada en el servidor."); await refresh();
     } catch (cause) { setError(cause instanceof Error ? cause.message : "No se pudo guardar la configuración."); }
     finally { setBusy(false); }
   }
@@ -487,6 +524,26 @@ export default function Home() {
   }
 
   async function markNotificationsRead() { await api("/me/notifications/read", { method: "POST", body: "{}" }); await refresh(); }
+  async function archiveNotification(id?: string) {
+    if (!dashboard) return;
+    const ids = id ? [id] : dashboard.notifications.map((notice) => notice.id);
+    if (!ids.length) return;
+    setError("");
+    setExitingNoticeIds(ids);
+    const reduceMotion = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!reduceMotion) await new Promise((resolve) => window.setTimeout(resolve, 300));
+    try {
+      setBusy(true);
+      await api("/me/notifications/archive", { method: "POST", body: JSON.stringify(id ? { id } : {}) });
+      setDashboard((current) => current ? { ...current, notifications: current.notifications.filter((notice) => !ids.includes(notice.id)) } : current);
+    } catch (cause) {
+      setExitingNoticeIds([]);
+      setError(cause instanceof Error ? cause.message : "No se pudo archivar el aviso.");
+    } finally {
+      setExitingNoticeIds([]);
+      setBusy(false);
+    }
+  }
 
   async function syncHistory() {
     setMessage(""); await refreshToday(false, true);
@@ -522,7 +579,7 @@ export default function Home() {
   if (!dashboard) return <main className="min-h-dvh bg-zinc-50 px-4 py-10 text-zinc-950"><div className="mx-auto max-w-sm"><div className="mb-8 flex items-center gap-3"><div className="rounded-2xl bg-emerald-700 p-3 text-white"><Clock3 className="h-7 w-7" /></div><div><p className="text-sm text-zinc-500">FP Llefià · Timenet</p><h1 className="text-2xl font-semibold">Control Horari</h1></div></div><section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm"><h2 className="text-lg font-semibold">Acceder</h2><p className="mt-1 text-sm text-zinc-500">Consulta tus fichajes y controla la automatización.</p><form className="mt-6 space-y-4" onSubmit={signIn}><div><Label htmlFor="username">Usuario</Label><Input id="username" autoComplete="username" className="mt-1 h-12" required value={username} onChange={(event) => setUsername(event.target.value)} /></div><div><Label htmlFor="password">Contraseña</Label><Input id="password" type="password" autoComplete="current-password" className="mt-1 h-12" required value={password} onChange={(event) => setPassword(event.target.value)} /></div><Button className="h-12 w-full" disabled={busy}>{busy ? <><Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />Accediendo…</> : "Entrar"}</Button></form>{error && <p role="alert" className="mx-4 mt-2 shrink-0 rounded-2xl bg-red-50 p-3 text-sm text-red-800">{error}</p>}</section></div></main>;
 
   const tabs: Array<[Tab, LucideIcon, string]> = [["home", House, "Inicio"], ["summary", CalendarClock, "Fichajes"], ["notifications", Bell, "Avisos"], ["settings", Settings, "Ajustes"]];
-  if (dashboard.profile.role === "admin") tabs.push(["monitor", Activity, "Monitor"]);
+  if (dashboard.profile.role === "admin") { tabs.push(["users", Users, "Usuarios"]); tabs.push(["monitor", Activity, "Monitor"]); }
   const today = new Intl.DateTimeFormat("en-GB", { timeZone: dashboard.profile.time_zone, day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date());
   const homeDate = viewDate ?? today;
   const homePrevDate = shiftLocalDate(homeDate, -1);
@@ -585,12 +642,12 @@ export default function Home() {
       </div>
     </section>}
 
-    {tab === "notifications" && <section className="py-5"><div className="mb-4 flex items-center justify-between"><div><h2 className="text-lg font-semibold">Avisos</h2><p className="text-sm text-zinc-500">Resultados y problemas de los fichajes.</p></div>{unread > 0 && <Button variant="secondary" onClick={() => void markNotificationsRead()}>Marcar leídos</Button>}</div><div className="space-y-3">{dashboard.notifications.map((notice) => <article key={notice.id} className={`rounded-xl border p-4 ${notice.level === "error" ? "border-rose-200 bg-rose-50/60" : notice.level === "warning" ? "border-amber-200 bg-amber-50/60" : notice.level === "success" ? "border-emerald-200 bg-emerald-50/60" : "border-zinc-200 bg-white"}`}><div className="flex gap-3">{notice.level === "success" ? <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" /> : notice.level === "error" ? <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" /> : <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />}<div><p className="font-medium">{notice.title}</p><p className="mt-1 text-sm text-zinc-600">{notice.message}</p><p className="mt-2 text-xs text-zinc-400">{timeLabel(notice.created_at)}</p></div></div></article>)}{!dashboard.notifications.length && <p className="rounded-xl border border-dashed border-zinc-300 p-5 text-sm text-zinc-500">No hay avisos.</p>}</div></section>}
+    {tab === "notifications" && <section className="py-5"><div className="mb-4 flex flex-wrap items-center justify-between gap-2"><div><h2 className="text-lg font-semibold">Avisos</h2><p className="text-sm text-zinc-500">Resultados y problemas de los fichajes.</p></div><div className="flex flex-wrap gap-2">{unread > 0 && <Button variant="secondary" onClick={() => void markNotificationsRead()}>Marcar leídos</Button>}{dashboard.notifications.length > 0 && <Button variant="secondary" disabled={busy} onClick={() => void archiveNotification()}>Archivar todos</Button>}</div></div><div className="space-y-3">{dashboard.notifications.map((notice) => <div key={notice.id} className={`notice-shell${exitingNoticeIds.includes(notice.id) ? " is-exiting" : ""}`}><div className="notice-shell-inner"><article className={`rounded-xl border p-4 ${notice.level === "error" ? "border-rose-200 bg-rose-50/60" : notice.level === "warning" ? "border-amber-200 bg-amber-50/60" : notice.level === "success" ? "border-emerald-200 bg-emerald-50/60" : "border-zinc-200 bg-white"}`}><div className="flex gap-3">{notice.level === "success" ? <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" /> : notice.level === "error" ? <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" /> : <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />}<div className="min-w-0 flex-1"><p className="font-medium">{notice.title}</p><p className="mt-1 text-sm text-zinc-600">{notice.message}</p><p className="mt-2 text-xs text-zinc-400">{timeLabel(notice.created_at)}</p></div><Button type="button" variant="secondary" size="icon" className="shrink-0" disabled={busy} aria-label="Archivar aviso" onClick={() => void archiveNotification(notice.id)}><Archive className="h-4 w-4" /></Button></div></article></div></div>)}{!dashboard.notifications.length && <p className="rounded-xl border border-dashed border-zinc-300 p-5 text-sm text-zinc-500">No hay avisos.</p>}</div></section>}
 
     <MobileSetup visible={tab === "settings"} />
-    {tab === "settings" && <section className="py-5"><div className="mb-5"><h2 className="text-lg font-semibold">Configuración</h2><p className="text-sm text-zinc-500">Los cambios se guardan en el servidor. Al guardar el margen o el horario se recalcula el aleatorio de los días futuros aún sin fichar (entrada 10 min antes y salida 10 min después del previsto de Timenet); los días ya fichados se conservan.</p></div><form className="space-y-4 pb-4" onSubmit={saveConfiguration}><div className="rounded-xl border border-zinc-200 bg-white p-4"><Label htmlFor="margin">Margen aleatorio (± segundos)</Label><p className="mt-1 text-sm text-zinc-500">Se aplica al crear o recalcular el plan de días sin fichar.</p><Input id="margin" className="mt-2 h-11" type="number" inputMode="numeric" min={0} max={3600} value={margin} onChange={(event) => setMargin(Number(event.target.value))} /></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><Label htmlFor="new-pin">Cambiar PIN de Timenet</Label><Input id="new-pin" className="mt-2 h-11" type="password" inputMode="numeric" autoComplete="off" placeholder="Déjalo vacío para conservarlo" value={newPin} onChange={(event) => setNewPin(event.target.value.replace(/\D/g, ""))} /></div><div className="space-y-3"><h3 className="font-semibold">Días con automatización</h3><p className="text-sm text-zinc-500">Activa o pausa cada día. Las horas de reserva solo se usan si aún no hay previsto de Timenet.</p>{schedules.map((day, index) => <div key={day.weekday} className="rounded-xl border border-zinc-200 bg-white p-4"><MobileSwitch label={`Automatizar ${dayNames[day.weekday]}`} checked={Boolean(day.enabled)} onChange={() => setSchedules(schedules.map((value, position) => position === index ? { ...value, enabled: value.enabled ? 0 : 1 } : value))}><span className="block text-base font-semibold">{dayNames[day.weekday]}</span><span className="block text-sm text-zinc-500">{day.enabled ? "Fichaje automático" : "Sin automatización"}</span></MobileSwitch><div hidden={!day.enabled} className="mt-3 grid grid-cols-2 gap-3 border-t border-zinc-100 pt-3"><div><Label htmlFor={`entry-${day.weekday}`}>Entrada (reserva)</Label><Input id={`entry-${day.weekday}`} className="mt-1 h-11" type="time" disabled={!day.enabled} value={day.entry_time} onChange={(event) => setSchedules(schedules.map((value, position) => position === index ? { ...value, entry_time: event.target.value } : value))} /></div><div><Label htmlFor={`exit-${day.weekday}`}>Salida (reserva)</Label><Input id={`exit-${day.weekday}`} className="mt-1 h-11" type="time" disabled={!day.enabled} value={day.exit_time} onChange={(event) => setSchedules(schedules.map((value, position) => position === index ? { ...value, exit_time: event.target.value } : value))} /></div></div></div>)}</div><Button className="settings-save h-12 w-full" disabled={busy} aria-busy={busy || undefined}>{busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Save className="h-4 w-4" aria-hidden="true" />}{busy ? "Guardando…" : "Guardar configuración"}</Button></form></section>}
+    {tab === "settings" && <section className="py-5"><div className="mb-5"><h2 className="text-lg font-semibold">Configuración</h2><p className="text-sm text-zinc-500">Los cambios se guardan en el servidor. Al guardar el margen o el horario se recalcula el aleatorio de los días futuros aún sin fichar (entrada 10 min antes y salida 10 min después del previsto de Timenet); los días ya fichados se conservan.</p></div><form className="space-y-4 pb-4" onSubmit={saveConfiguration}><div className="rounded-xl border border-zinc-200 bg-white p-4"><Label htmlFor="margin">Margen aleatorio (± segundos)</Label><p className="mt-1 text-sm text-zinc-500">Se aplica al crear o recalcular el plan de días sin fichar.</p><Input id="margin" className="mt-2 h-11" type="number" inputMode="numeric" min={0} max={3600} value={margin} onChange={(event) => setMargin(Number(event.target.value))} /></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><Label htmlFor="new-password">Cambiar contraseña</Label><Input id="new-password" className="mt-2 h-11" type="password" autoComplete="new-password" minLength={10} placeholder="Déjala vacía para conservarla" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} /></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><Label htmlFor="new-pin">Cambiar PIN de Timenet</Label><Input id="new-pin" className="mt-2 h-11" type="password" inputMode="numeric" autoComplete="off" placeholder="Déjalo vacío para conservarlo" value={newPin} onChange={(event) => setNewPin(event.target.value.replace(/\D/g, ""))} /></div><div className="space-y-3"><h3 className="font-semibold">Días con automatización</h3><p className="text-sm text-zinc-500">Activa o pausa cada día. Las horas de reserva solo se usan si aún no hay previsto de Timenet.</p>{schedules.map((day, index) => <div key={day.weekday} className="rounded-xl border border-zinc-200 bg-white p-4"><MobileSwitch label={`Automatizar ${dayNames[day.weekday]}`} checked={Boolean(day.enabled)} onChange={() => setSchedules(schedules.map((value, position) => position === index ? { ...value, enabled: value.enabled ? 0 : 1 } : value))}><span className="block text-base font-semibold">{dayNames[day.weekday]}</span><span className="block text-sm text-zinc-500">{day.enabled ? "Fichaje automático" : "Sin automatización"}</span></MobileSwitch><div hidden={!day.enabled} className="mt-3 grid grid-cols-2 gap-3 border-t border-zinc-100 pt-3"><div><Label htmlFor={`entry-${day.weekday}`}>Entrada (reserva)</Label><Input id={`entry-${day.weekday}`} className="mt-1 h-11" type="time" disabled={!day.enabled} value={day.entry_time} onChange={(event) => setSchedules(schedules.map((value, position) => position === index ? { ...value, entry_time: event.target.value } : value))} /></div><div><Label htmlFor={`exit-${day.weekday}`}>Salida (reserva)</Label><Input id={`exit-${day.weekday}`} className="mt-1 h-11" type="time" disabled={!day.enabled} value={day.exit_time} onChange={(event) => setSchedules(schedules.map((value, position) => position === index ? { ...value, exit_time: event.target.value } : value))} /></div></div></div>)}</div><Button className="settings-save h-12 w-full" disabled={busy} aria-busy={busy || undefined}>{busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Save className="h-4 w-4" aria-hidden="true" />}{busy ? "Guardando…" : "Guardar configuración"}</Button></form></section>}
 
-    {tab === "monitor" && dashboard.profile.role === "admin" && <section className="space-y-5 py-5"><div><h2 className="text-lg font-semibold">Rendimiento del sistema</h2><p className="text-sm text-zinc-500">Salud global, usuarios y prevención de fallos.</p></div>{adminHealth ? <><div className="grid grid-cols-2 gap-3 sm:grid-cols-4"><MetricCard label="Usuarios" value={String(adminHealth.users?.total || 0)} /><MetricCard label="Automatizaciones" value={String(adminHealth.users?.enabled || 0)} /><MetricCard label="Último ciclo" value={adminHealth.latestRuns[0]?.status || "—"} detail={timeLabel(adminHealth.latestRuns[0]?.started_at)} /><MetricCard label="Duración" value={`${adminHealth.latestRuns[0]?.duration_ms || 0}ms`} /></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><h3 className="font-semibold">Personas</h3><div className="mt-3 divide-y divide-zinc-100">{adminUsers.map((person) => <div key={person.id} className="flex items-center justify-between gap-3 py-3 text-sm"><div><p className="font-medium">{person.display_name}</p><p className="text-zinc-500">@{person.username} · {person.role === "admin" ? "Administrador" : "Usuario"}</p></div><span className={person.enabled ? "text-emerald-700" : "text-zinc-500"}>{person.enabled ? "Activo" : "Parado"}</span></div>)}</div><form className="mt-4 grid gap-3 border-t border-zinc-100 pt-4 sm:grid-cols-2" onSubmit={createAccount}><div><Label htmlFor="account-name">Nombre</Label><Input id="account-name" required value={userForm.displayName} onChange={(event) => setUserForm({ ...userForm, displayName: event.target.value })} /></div><div><Label htmlFor="account-user">Usuario</Label><Input id="account-user" required value={userForm.username} onChange={(event) => setUserForm({ ...userForm, username: event.target.value })} /></div><div><Label htmlFor="account-password">Contraseña inicial</Label><Input id="account-password" type="password" minLength={10} required value={userForm.password} onChange={(event) => setUserForm({ ...userForm, password: event.target.value })} /></div><div><Label htmlFor="account-pin">PIN de Timenet</Label><Input id="account-pin" type="password" inputMode="numeric" required value={userForm.timenetPin} onChange={(event) => setUserForm({ ...userForm, timenetPin: event.target.value.replace(/\D/g, "") })} /></div><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={userForm.role === "admin"} onChange={(event) => setUserForm({ ...userForm, role: event.target.checked ? "admin" : "user" })} />También administrador</label><Button disabled={busy}>Crear usuario</Button></form></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><h3 className="font-semibold">Últimas ejecuciones del programador</h3><div className="mt-3 divide-y divide-zinc-100">{adminHealth.latestRuns.slice(0, 10).map((run) => <div key={run.id} className="flex items-center justify-between gap-3 py-3 text-sm"><div><p className="font-medium">{timeLabel(run.started_at)}</p><p className="text-zinc-500">{run.users_scanned} usuarios · {run.jobs_processed} trabajos</p></div><span className={run.status === "success" ? "text-emerald-700" : "text-red-700"}>{run.status}</span></div>)}</div></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><h3 className="font-semibold">Fallos recientes</h3><div className="mt-3 space-y-3">{adminHealth.recentFailures.map((failure) => <div key={failure.id} className="rounded-lg bg-red-50 p-3 text-sm"><p className="font-medium text-red-900">{failure.display_name} · {failure.action === "entry" ? "Entrada" : "Salida"}</p><p className="mt-1 text-red-800">{failure.error_message}</p></div>)}{!adminHealth.recentFailures.length && <p className="text-sm text-zinc-500">No hay fallos recientes.</p>}</div></div></> : <p role="status" className="text-sm text-zinc-500">Cargando métricas…</p>}</section>}
+    {tab === "users" && dashboard.profile.role === "admin" && <section className="space-y-5 py-5"><div><h2 className="text-lg font-semibold">Usuarios</h2><p className="text-sm text-zinc-500">Cuentas, roles y altas nuevas.</p></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><h3 className="font-semibold">Nuevo usuario</h3><p className="mt-1 text-sm text-zinc-500">Alta de cuenta con PIN de Timenet.</p><form className="mt-4 grid gap-3 sm:grid-cols-2" onSubmit={createAccount}><div><Label htmlFor="account-name">Nombre</Label><Input id="account-name" required value={userForm.displayName} onChange={(event) => setUserForm({ ...userForm, displayName: event.target.value })} /></div><div><Label htmlFor="account-user">Usuario</Label><Input id="account-user" required value={userForm.username} onChange={(event) => setUserForm({ ...userForm, username: event.target.value })} /></div><div><Label htmlFor="account-password">Contraseña inicial</Label><Input id="account-password" type="password" minLength={10} required value={userForm.password} onChange={(event) => setUserForm({ ...userForm, password: event.target.value })} /></div><div><Label htmlFor="account-pin">PIN de Timenet</Label><Input id="account-pin" type="password" inputMode="numeric" required value={userForm.timenetPin} onChange={(event) => setUserForm({ ...userForm, timenetPin: event.target.value.replace(/\D/g, "") })} /></div><label className="flex items-center gap-2 text-sm sm:col-span-2"><input type="checkbox" checked={userForm.role === "admin"} onChange={(event) => setUserForm({ ...userForm, role: event.target.checked ? "admin" : "user" })} />También administrador</label><Button className="sm:col-span-2" disabled={busy}>Crear usuario</Button></form></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><h3 className="font-semibold">Lista de usuarios</h3><div className="mt-3 divide-y divide-zinc-100">{adminUsers.map((person) => <div key={person.id} className="flex items-center justify-between gap-3 py-3 text-sm"><div><p className="font-medium">{person.display_name}</p><p className="text-zinc-500">@{person.username} · {person.role === "admin" ? "Administrador" : "Usuario"}</p></div><span className={person.enabled ? "text-emerald-700" : "text-zinc-500"}>{person.enabled ? "Activo" : "Parado"}</span></div>)}</div>{!adminUsers.length && <p className="py-3 text-sm text-zinc-500">No hay usuarios.</p>}</div></section>}{tab === "monitor" && dashboard.profile.role === "admin" && <section className="space-y-5 py-5"><div><h2 className="text-lg font-semibold">Monitor</h2><p className="text-sm text-zinc-500">Salud del sistema, fichajes y ciclos del programador.</p></div>{adminHealth ? <><div className="rounded-xl border border-zinc-200 bg-white p-4"><div className="grid grid-cols-2 gap-3"><MetricCard label="Usuarios" value={String(adminHealth.users?.total || 0)} /><MetricCard label="Automatizaciones" value={String(adminHealth.users?.enabled || 0)} /></div><div className="mt-4 space-y-3"><div className="flex items-center justify-between gap-3"><h3 className="font-semibold">Fichajes recientes</h3><MobileSwitch label="Solo fallos" checked={onlyFailures} onChange={() => setOnlyFailures((value) => !value)}><span className="text-sm font-medium text-zinc-600">Solo fallos</span></MobileSwitch></div><label className="block"><span className="sr-only">Filtrar por usuario</span><select id="punch-user-filter" className="h-11 w-full rounded-xl border border-zinc-200 bg-white px-3 text-sm text-zinc-950 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100" value={punchUserFilter} onChange={(event) => setPunchUserFilter(event.target.value)}><option value="all">Todos los usuarios</option>{adminUsers.filter((person) => person.enabled).map((person) => <option key={person.id} value={person.username}>{person.display_name}</option>)}</select></label></div><div className="mt-3 max-h-64 space-y-3 overflow-y-auto overscroll-contain pr-1">{(() => { const jobs = adminHealth.recentJobs.filter((job) => (!onlyFailures || ["failed", "uncertain", "missed"].includes(job.status)) && (punchUserFilter === "all" || job.username === punchUserFilter)).slice().sort((a, b) => punchStamp(b) - punchStamp(a)); if (!jobs.length) return <p className="text-sm text-zinc-500">{onlyFailures ? "No hay fallos recientes." : "No hay fichajes recientes."}</p>; return jobs.map((job) => {  const tone = job.status === "success" ? "bg-emerald-50 text-emerald-900" : job.status === "uncertain" ? "bg-amber-50 text-amber-950" : "bg-red-50 text-red-900";  const timeTone = job.status === "success" ? "text-emerald-700/80" : job.status === "uncertain" ? "text-amber-800/80" : "text-red-700/80";  const messageTone = job.status === "success" ? "text-emerald-800" : job.status === "uncertain" ? "text-amber-900" : "text-red-800";  return <div key={job.id} className={`rounded-lg p-3 text-sm ${tone}`}>   <p className="font-medium">{job.display_name} · {job.action === "entry" ? "Entrada" : "Salida"} · {originLabels[job.origin] || originLabels.manual} · {statusLabels[job.status]}</p>   <p className={`mt-1 text-xs ${timeTone}`}>{punchTimeLabel(job)}</p>   {job.error_message && <p className={`mt-1 ${messageTone}`}>{job.error_message}</p>}  </div>; });})()}</div></div><div className="rounded-xl border border-zinc-200 bg-white p-4"><div className="grid grid-cols-2 gap-3"><MetricCard label="Último ciclo" value={adminHealth.latestRuns[0]?.status || "—"} detail={timeLabel(adminHealth.latestRuns[0]?.started_at)} /><MetricCard label="Duración" value={adminHealth.latestRuns[0]?.duration_ms != null ? `${adminHealth.latestRuns[0].duration_ms}ms` : "—"} /></div><h3 className="mt-4 font-semibold">Últimas ejecuciones del programador</h3><div className="mt-3 max-h-56 overflow-y-auto overscroll-contain divide-y divide-zinc-100">{adminHealth.latestRuns.map((run) => <div key={run.id} className="flex items-center justify-between gap-3 py-3 text-sm"><div><p className="font-medium">{timeLabel(run.started_at)}</p><p className="text-zinc-500">{run.users_scanned} usuarios · {run.jobs_processed} trabajos</p></div><span className={run.status === "success" ? "text-emerald-700" : "text-red-700"}>{run.status}</span></div>)}</div></div></> : <p role="status" className="text-sm text-zinc-500">Cargando métricas…</p>}</section>}
     </div>
     <nav className="app-tabbar grid shrink-0 gap-2" style={{ gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))` }} aria-label="Secciones">{tabs.map(([value, Icon, label]) => <button key={value} type="button" aria-current={tab === value ? "page" : undefined} onClick={() => setTab(value)} className={`relative flex min-h-14 min-w-0 touch-manipulation flex-col items-center justify-center gap-1 rounded-2xl text-xs font-semibold transition-colors active:scale-95 ${tab === value ? "bg-emerald-50 text-emerald-800" : "text-zinc-600 hover:bg-zinc-50"}`}><span className="relative"><Icon aria-hidden="true" className="h-6 w-6" />{value === "notifications" && unread > 0 && <span className="absolute -right-2 -top-1 grid min-w-3.5 place-items-center rounded-full bg-rose-500 px-1 text-[9px] text-white">{unread}</span>}</span><span>{label}</span></button>)}</nav>
   </div></main>;

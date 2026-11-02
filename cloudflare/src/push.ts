@@ -47,7 +47,7 @@ export async function flushPush(env: Env) {
   if (!pushConfig(env).configured) return;
   const now = Date.now();
   await env.DB.prepare("UPDATE notifications SET push_state = 'pending' WHERE push_state = 'sending' AND push_updated_at < ?").bind(now - 120_000).run();
-  const pending = await env.DB.prepare("SELECT id, user_id, title, message, level FROM notifications WHERE push_state = 'pending' AND push_attempts < 3 ORDER BY created_at LIMIT 20")
+  const pending = await env.DB.prepare("SELECT id, user_id, title, message, level FROM notifications WHERE push_state = 'pending' AND push_attempts < 3 AND archived_at IS NULL ORDER BY created_at LIMIT 20")
     .all<{ id: string; user_id: string; title: string; message: string; level: string }>();
   for (const notice of pending.results) {
     const claim = await env.DB.prepare("UPDATE notifications SET push_state = 'sending', push_attempts = push_attempts + 1, push_updated_at = ? WHERE id = ? AND push_state = 'pending'").bind(now, notice.id).run();

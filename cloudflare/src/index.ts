@@ -1,5 +1,5 @@
 import { authenticate, createUser, login, logout, type NewUserInput } from "./auth";
-import { decryptSecret, encryptSecret, secureEqual, sha256 } from "./crypto";
+import { decryptSecret, encryptSecret, hashPassword, randomBase64, secureEqual, sha256 } from "./crypto";
 import { runScheduler } from "./scheduler";
 import { flushPush, pushConfig, testPush, validSubscription } from "./push";
 import { guardedTimenetPunch, readTimenetHistory, TimenetError, type PunchResult } from "./timenet";
@@ -59,7 +59,7 @@ async function dashboard(env: Env, user: SessionUser) {
       "SELECT id, local_date, action, source, recorded_time, created_at FROM punch_events WHERE user_id = ? ORDER BY substr(local_date,7,4) DESC, substr(local_date,4,2) DESC, substr(local_date,1,2) DESC, recorded_time DESC LIMIT 1000",
     ).bind(user.id).all(),
     env.DB.prepare(
-      "SELECT id, level, title, message, job_id, created_at, read_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+      "SELECT id, level, title, message, job_id, created_at, read_at FROM notifications WHERE user_id = ? AND archived_at IS NULL ORDER BY created_at DESC LIMIT 50",
     ).bind(user.id).all(),
     env.DB.prepare("SELECT * FROM scheduler_runs ORDER BY started_at DESC LIMIT 1").first(),
     env.DB.prepare(
@@ -98,7 +98,7 @@ async function todayDashboard(env: Env, user: SessionUser) {
     env.DB.prepare("SELECT * FROM jobs WHERE user_id = ? AND local_date = ?").bind(user.id, date).all(),
     env.DB.prepare("SELECT id, local_date, action, source, recorded_time, created_at FROM punch_events WHERE user_id = ? AND local_date = ? ORDER BY recorded_time").bind(user.id, date).all(),
     env.DB.prepare("SELECT * FROM calendar_days WHERE user_id = ? AND local_date = ?").bind(user.id, date).all(),
-    env.DB.prepare("SELECT id, level, title, message, created_at, read_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").bind(user.id).all(),
+    env.DB.prepare("SELECT id, level, title, message, created_at, read_at FROM notifications WHERE user_id = ? AND archived_at IS NULL ORDER BY created_at DESC LIMIT 50").bind(user.id).all(),
   ]);
   return { ok: true, date, profile, schedules: schedules.results, jobs: jobs.results, events: events.results,
     calendar: calendar.results, notifications: notifications.results, health: { latestRun: null, schedulerHealthy: false, last24Hours: null } };
@@ -384,6 +384,14 @@ async function updateConfig(request: Request, env: Env, user: SessionUser) {
         .bind(encrypted.ciphertext, encrypted.iv, now, user.id),
     );
   }
+  if (typeof body.password === "string" && body.password.length) {
+    if (body.password.length < 10 || body.password.length > 256) return error("La contraseña debe tener entre 10 y 256 caracteres.");
+    const salt = randomBase64(16);
+    statements.push(
+      env.DB.prepare("UPDATE users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?")
+        .bind(await hashPassword(body.password, salt, env.AUTH_PEPPER), salt, now, user.id),
+    );
+  }
   for (const schedule of schedules) {
     statements.push(
       env.DB.prepare(
@@ -397,18 +405,28 @@ async function updateConfig(request: Request, env: Env, user: SessionUser) {
 }
 
 async function adminHealth(env: Env) {
-  const [latestRuns, statusCounts, users, recentFailures] = await Promise.all([
-    env.DB.prepare("SELECT * FROM scheduler_runs ORDER BY started_at DESC LIMIT 30").all(),
+  const [latestRuns, statusCounts, users, recentJobs] = await Promise.all([
+    env.DB.prepare("SELECT * FROM scheduler_runs ORDER BY started_at DESC LIMIT 20").all(),
     env.DB.prepare("SELECT status, COUNT(*) AS count FROM jobs WHERE target_at >= ? GROUP BY status")
       .bind(Date.now() - 7 * 24 * 60 * 60 * 1000).all(),
     env.DB.prepare("SELECT COUNT(*) AS total, SUM(enabled) AS enabled FROM users").first(),
     env.DB.prepare(
-      `SELECT j.id, j.local_date, j.action, j.status, j.error_code, j.error_message, j.updated_at, u.username, u.display_name
-       FROM jobs j JOIN users u ON u.id = j.user_id
-       WHERE j.status IN ('failed', 'uncertain', 'missed') ORDER BY j.updated_at DESC LIMIT 30`,
+      `SELECT * FROM (
+         SELECT j.id, j.local_date, j.action, j.status, j.error_code, j.error_message, j.target_at, j.executed_at, j.updated_at,
+                j.timenet_time AS recorded_time, u.username, u.display_name, 'automatic' AS origin
+         FROM jobs j JOIN users u ON u.id = j.user_id
+         WHERE u.enabled = 1 AND j.status IN ('success', 'failed', 'uncertain', 'missed')
+         UNION ALL
+         SELECT pe.id, pe.local_date, pe.action, 'success' AS status, NULL AS error_code, NULL AS error_message,
+                NULL AS target_at, pe.created_at AS executed_at, pe.created_at AS updated_at,
+                pe.recorded_time, u.username, u.display_name, 'app' AS origin
+         FROM punch_events pe JOIN users u ON u.id = pe.user_id
+         WHERE u.enabled = 1 AND pe.source = 'manual' AND pe.id LIKE 'manual:%'
+       )
+       ORDER BY COALESCE(executed_at, target_at, updated_at) DESC LIMIT 40`,
     ).all(),
   ]);
-  return json({ ok: true, latestRuns: latestRuns.results, statusCounts: statusCounts.results, users, recentFailures: recentFailures.results });
+  return json({ ok: true, latestRuns: latestRuns.results, statusCounts: statusCounts.results, users, recentJobs: recentJobs.results });
 }
 
 async function route(request: Request, env: Env) {
@@ -503,6 +521,20 @@ async function route(request: Request, env: Env) {
   if (method === "POST" && jobResolution) return resolveUncertainJob(request, env, user, decodeURIComponent(jobResolution[1]));
   if (method === "POST" && url.pathname === "/api/me/notifications/read") {
     await env.DB.prepare("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL").bind(Date.now(), user.id).run();
+    return json({ ok: true });
+  }
+  if (method === "POST" && url.pathname === "/api/me/notifications/archive") {
+    const body = await bodyAsObject(request);
+    const now = Date.now();
+    const noticeId = typeof body.id === "string" ? body.id.trim() : "";
+    if (noticeId) {
+      const result = await env.DB.prepare("UPDATE notifications SET archived_at = ?, read_at = COALESCE(read_at, ?) WHERE id = ? AND user_id = ? AND archived_at IS NULL")
+        .bind(now, now, noticeId, user.id).run();
+      if (!result.meta.changes) return error("Aviso no encontrado.", 404);
+    } else {
+      await env.DB.prepare("UPDATE notifications SET archived_at = ?, read_at = COALESCE(read_at, ?) WHERE user_id = ? AND archived_at IS NULL")
+        .bind(now, now, user.id).run();
+    }
     return json({ ok: true });
   }
   if (method === "GET" && url.pathname === "/api/admin/health") {

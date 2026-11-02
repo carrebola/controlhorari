@@ -152,6 +152,25 @@ button:focus-visible, summary:focus-visible, select:focus-visible { outline: 2px
   .app-tabbar button { min-height: 48px; flex-direction: row; }
 }
 
+.notice-shell {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition:
+    grid-template-rows 280ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 220ms ease,
+    transform 280ms cubic-bezier(0.22, 1, 0.36, 1),
+    margin 280ms ease;
+}
+.notice-shell > .notice-shell-inner { min-height: 0; overflow: hidden; }
+.notice-shell.is-exiting {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-6px) scale(0.98);
+  margin-bottom: -0.75rem;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
 }
