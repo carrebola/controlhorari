@@ -147,7 +147,7 @@ async function punchOnPage(
   } catch (error) {
     if (clicked) {
       try {
-        return await confirmViaHistory(page, action, localDate);
+        return await confirmViaHistory(page, action, localDate, timeZone);
       } catch (historyError) {
         console.error("No se pudo confirmar el fichaje en el historial de Timenet", historyError);
       }
@@ -188,20 +188,49 @@ async function confirmPunchAfterClick(
     };
   } catch (uiError) {
     console.error("La UI de Timenet no confirmó el fichaje a tiempo; se comprueba el historial", uiError);
-    return confirmViaHistory(page, action, localDate);
+    return confirmViaHistory(page, action, localDate, timeZone);
   }
 }
 
-async function confirmViaHistory(page: Page, action: JobAction, localDate: string): Promise<PunchResult> {
-  const history = await readHistoryOnPage(page);
-  const match = historyConfirmsPunch(history.events, localDate, action);
-  if (match) {
-    return {
-      ok: true,
-      time: match.time,
-      code: "confirmed_by_history",
-      message: `${action === "entry" ? "Entrada" : "Salida"} confirmada en el historial de Timenet.`,
-    };
+async function sleep(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function confirmViaHistory(page: Page, action: JobAction, localDate: string, timeZone: string): Promise<PunchResult> {
+  // Timenet often lags the home UI; retry history before locking the day as uncertain.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await sleep(2_000 * attempt);
+      await page.goto("https://timenet-wcp.gpisoftware.com/home", { waitUntil: "domcontentloaded", timeout: 20_000 });
+    }
+    try {
+      const history = await readHistoryOnPage(page);
+      const match = historyConfirmsPunch(history.events, localDate, action);
+      if (match) {
+        return {
+          ok: true,
+          time: match.time,
+          code: "confirmed_by_history",
+          message: `${action === "entry" ? "Entrada" : "Salida"} confirmada en el historial de Timenet.`,
+        };
+      }
+    } catch (historyError) {
+      console.error("No se pudo leer el historial de Timenet tras el fichaje", historyError);
+    }
+  }
+  try {
+    await page.goto("https://timenet-wcp.gpisoftware.com/home", { waitUntil: "domcontentloaded", timeout: 20_000 });
+    const working = await page.evaluate(() => document.body.innerText.split("\n").some((line) => line.trim() === "treballant"));
+    if ((action === "entry" && working) || (action === "exit" && !working)) {
+      return {
+        ok: true,
+        time: localClock(Date.now(), timeZone),
+        code: "confirmed_by_state",
+        message: `${action === "entry" ? "Entrada" : "Salida"} confirmada por el estado de Timenet.`,
+      };
+    }
+  } catch (stateError) {
+    console.error("No se pudo reconsultar el estado de Timenet tras el fichaje", stateError);
   }
   return {
     ok: false,
